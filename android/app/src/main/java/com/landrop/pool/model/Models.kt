@@ -4,10 +4,12 @@ import android.net.Uri
 
 data class SharedFile(
     val id: String,
-    val uri: Uri,
+    val uri: Uri? = null,
     val name: String,
     val size: Long,
-    val mime: String
+    val mime: String = "application/octet-stream",
+    val type: String = "file",
+    val content: String? = null
 )
 
 data class RemotePeer(
@@ -22,7 +24,9 @@ data class RemotePeer(
 data class RemoteFileInfo(
     val id: String,
     val name: String,
-    val size: Long
+    val size: Long,
+    val type: String = "file",
+    val content: String? = null
 )
 
 data class RemoteFileItem(
@@ -32,7 +36,9 @@ data class RemoteFileItem(
     val peerDeviceId: String,
     val peerName: String,
     val peerIp: String,
-    val peerPort: Int
+    val peerPort: Int,
+    val type: String = "file",
+    val content: String? = null
 )
 
 data class TransferState(

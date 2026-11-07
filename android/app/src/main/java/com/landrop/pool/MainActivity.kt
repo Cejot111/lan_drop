@@ -1,5 +1,9 @@
 package com.landrop.pool
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -11,6 +15,8 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -78,15 +84,80 @@ class MainActivity : ComponentActivity() {
         httpServer = LocalHttpServer(this, deviceId, deviceName)
         val port = httpServer.start()
 
-        // Start rozgłaszania LAN (UDP Broadcast)
+        // Start rozgłaszania LAN (UDP Broadcast + Unicast + TCP polling)
         discovery = LanDiscovery(this, deviceId, deviceName, port)
         discovery.start()
+
+        // Obsługa intencji udostępniania z menu systemowego Androida
+        handleIncomingIntent(intent)
 
         setContent {
             LanDropTheme {
                 MainAppScreen()
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        if (intent == null) return
+        val action = intent.action
+        val type = intent.type
+
+        if (Intent.ACTION_SEND == action && type != null) {
+            val extraText = intent.getStringExtra(Intent.EXTRA_TEXT)
+            if (extraText != null && extraText.isNotBlank()) {
+                addLinkOrTextToPool(extraText)
+            } else {
+                val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+                }
+                if (uri != null) {
+                    addUrisToPool(listOf(uri))
+                }
+            }
+        } else if (Intent.ACTION_SEND_MULTIPLE == action && type != null) {
+            val uris = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)
+            }
+            if (!uris.isNullOrEmpty()) {
+                addUrisToPool(uris)
+            }
+        }
+    }
+
+    private fun addLinkOrTextToPool(rawText: String) {
+        val trimmed = rawText.trim()
+        val urlRegex = "(https?://[^\\s]+)".toRegex()
+        val match = urlRegex.find(trimmed)
+        val finalUrl = match?.value ?: trimmed
+
+        val item = SharedFile(
+            id = UUID.randomUUID().toString(),
+            uri = null,
+            name = finalUrl,
+            size = finalUrl.toByteArray(Charsets.UTF_8).size.toLong(),
+            mime = "text/x-uri",
+            type = "link",
+            content = finalUrl
+        )
+        mySharedFiles.add(item)
+        val currentList = mySharedFiles.toList()
+        httpServer.updateFiles(currentList)
+        discovery.updateSharedFiles(currentList)
+
+        Toast.makeText(this, "Dodano link do puli LAN!", Toast.LENGTH_SHORT).show()
     }
 
     private fun addUrisToPool(uris: List<Uri>) {
@@ -99,7 +170,9 @@ class MainActivity : ComponentActivity() {
                 uri = uri,
                 name = name,
                 size = size,
-                mime = mime
+                mime = mime,
+                type = "file",
+                content = null
             )
             mySharedFiles.add(item)
             addedCount++
@@ -159,6 +232,27 @@ class MainActivity : ComponentActivity() {
         return "LAN"
     }
 
+    private fun openLinkInBrowser(rawUrl: String) {
+        val target = if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) {
+            "https://$rawUrl"
+        } else {
+            rawUrl
+        }
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(target))
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "Nie można otworzyć linku: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun copyToClipboard(text: String, label: String = "Link") {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val clip = ClipData.newPlainText(label, text)
+        clipboard.setPrimaryClip(clip)
+        Toast.makeText(this, "Skopiowano do schowka: $text", Toast.LENGTH_SHORT).show()
+    }
+
     @OptIn(ExperimentalMaterial3Api::class)
     @Composable
     fun MainAppScreen() {
@@ -166,6 +260,61 @@ class MainActivity : ComponentActivity() {
         val transfersState by transfers.collectAsState()
         val scope = rememberCoroutineScope()
         var selectedTab by remember { mutableStateOf(0) }
+        var showAddLinkDialog by remember { mutableStateOf(false) }
+
+        if (showAddLinkDialog) {
+            var urlInput by remember { mutableStateOf("") }
+            AlertDialog(
+                onDismissRequest = { showAddLinkDialog = false },
+                containerColor = DarkCard,
+                title = {
+                    Text("Udostępnij link WWW", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                },
+                text = {
+                    Column {
+                        Text(
+                            "Wpisz lub wklej adres strony. Pojawi się w puli komputerów z przyciskiem do natychmiastowego otwarcia.",
+                            color = TextMuted,
+                            fontSize = 12.sp,
+                            lineHeight = 16.sp
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = urlInput,
+                            onValueChange = { urlInput = it },
+                            placeholder = { Text("https://...", color = TextMuted) },
+                            singleLine = true,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = Color.White,
+                                unfocusedTextColor = Color.White,
+                                focusedBorderColor = Color.White,
+                                unfocusedBorderColor = DarkBorder,
+                                cursorColor = Color.White
+                            ),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (urlInput.isNotBlank()) {
+                                addLinkOrTextToPool(urlInput)
+                                showAddLinkDialog = false
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White)
+                    ) {
+                        Text("Dodaj", color = Color.Black, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showAddLinkDialog = false }) {
+                        Text("Anuluj", color = TextMuted)
+                    }
+                }
+            )
+        }
 
         Scaffold(
             topBar = {
@@ -249,6 +398,7 @@ class MainActivity : ComponentActivity() {
                         onPickFiles = {
                             openDocumentsLauncher.launch(arrayOf("*/*"))
                         },
+                        onAddLink = { showAddLinkDialog = true },
                         onClearPool = { clearMyPool() },
                         onRemoveFile = { id -> removeFileFromPool(id) }
                     )
@@ -256,6 +406,8 @@ class MainActivity : ComponentActivity() {
                     NetworkPoolTabContent(
                         peers = peersState.values.toList(),
                         transfers = transfersState,
+                        onOpenLink = { url -> openLinkInBrowser(url) },
+                        onCopyLink = { url -> copyToClipboard(url) },
                         onDownloadFile = { item ->
                             scope.launch {
                                 downloader.download(item, transfers)
@@ -271,6 +423,7 @@ class MainActivity : ComponentActivity() {
     fun MyPoolTabContent(
         onPickGallery: () -> Unit,
         onPickFiles: () -> Unit,
+        onAddLink: () -> Unit,
         onClearPool: () -> Unit,
         onRemoveFile: (String) -> Unit
     ) {
@@ -279,20 +432,21 @@ class MainActivity : ComponentActivity() {
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            // Przyciski dodawania
+            // Przyciski dodawania (Galeria, Pliki, Link)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
                     onClick = onPickGallery,
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                    shape = RoundedCornerShape(12.dp)
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
                 ) {
-                    Icon(Icons.Default.PhotoLibrary, contentDescription = null, tint = Color.Black)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Z Galerii", color = Color.Black, fontWeight = FontWeight.Bold)
+                    Icon(Icons.Default.PhotoLibrary, contentDescription = null, tint = Color.Black, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Galeria", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
 
                 Button(
@@ -300,15 +454,29 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.weight(1f),
                     colors = ButtonDefaults.buttonColors(containerColor = DarkCard),
                     border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
-                    shape = RoundedCornerShape(12.dp)
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
                 ) {
-                    Icon(Icons.Default.Folder, contentDescription = null, tint = Color.White)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Z Plików", color = Color.White, fontWeight = FontWeight.Bold)
+                    Icon(Icons.Default.Folder, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Pliki", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
+
+                Button(
+                    onClick = onAddLink,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = DarkCard),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 10.dp)
+                ) {
+                    Icon(Icons.Default.Link, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Link", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
                 }
             }
 
-            Spacer(Modifier.height(18.dp))
+            Spacer(Modifier.height(16.dp))
 
             // Nagłówek sekcji
             Row(
@@ -346,9 +514,9 @@ class MainActivity : ComponentActivity() {
                         Icon(Icons.Default.UploadFile, contentDescription = null, tint = TextMuted, modifier = Modifier.size(40.dp))
                         Spacer(Modifier.height(10.dp))
                         Text("Pula jest pusta", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                        Spacer(Modifier.height(4.dp))
+                        Spacer(Modifier.height(6.dp))
                         Text(
-                            "Wybierz zdjęcia lub pliki powyżej.\nZawisną w sieci i komputery będą mogły je pobrać.",
+                            "Wybierz pliki/link powyżej lub udostępnij bezpośrednio z innej aplikacji (menu Udostępnij -> LAN Drop).",
                             color = TextMuted,
                             fontSize = 12.sp,
                             lineHeight = 16.sp,
@@ -374,9 +542,25 @@ class MainActivity : ComponentActivity() {
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(f.name, fontWeight = FontWeight.SemiBold, maxLines = 1, color = Color.White, fontSize = 14.sp)
-                                    Text(formatSize(f.size), fontSize = 12.sp, color = TextMuted)
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = if (f.type == "link") Icons.Default.Link else Icons.Default.InsertDriveFile,
+                                        contentDescription = null,
+                                        tint = if (f.type == "link") AccentGreen else TextMuted,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(f.name, fontWeight = FontWeight.SemiBold, maxLines = 1, color = Color.White, fontSize = 14.sp)
+                                        Text(
+                                            if (f.type == "link") "Link WWW" else formatSize(f.size),
+                                            fontSize = 12.sp,
+                                            color = TextMuted
+                                        )
+                                    }
                                 }
                                 IconButton(onClick = { onRemoveFile(f.id) }) {
                                     Icon(Icons.Default.Close, contentDescription = "Usuń", tint = TextMuted)
@@ -389,17 +573,20 @@ class MainActivity : ComponentActivity() {
 
             Spacer(Modifier.height(10.dp))
             Text(
-                "💡 Pliki znikną z sieci po zamknięciu aplikacji.",
+                "💡 Pliki i linki wiszą w sieci dopóki nie zamkniesz aplikacji.",
                 fontSize = 11.sp,
                 color = Color.DarkGray
             )
         }
     }
 
+    @OptIn(ExperimentalFoundationApi::class)
     @Composable
     fun NetworkPoolTabContent(
         peers: List<com.landrop.pool.model.RemotePeer>,
         transfers: Map<String, TransferState>,
+        onOpenLink: (String) -> Unit,
+        onCopyLink: (String) -> Unit,
         onDownloadFile: (RemoteFileItem) -> Unit
     ) {
         val allRemoteFiles = remember(peers) {
@@ -414,7 +601,9 @@ class MainActivity : ComponentActivity() {
                             peerDeviceId = p.deviceId,
                             peerName = p.deviceName,
                             peerIp = p.ip,
-                            peerPort = p.port
+                            peerPort = p.port,
+                            type = f.type,
+                            content = f.content
                         )
                     )
                 }
@@ -428,7 +617,7 @@ class MainActivity : ComponentActivity() {
                 .padding(16.dp)
         ) {
             Text(
-                "PLIKI WYSTAWIONE PRZEZ KOMPUTERY",
+                "ELEMENTY WYSTAWIONE PRZEZ KOMPUTERY",
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Bold,
                 letterSpacing = 1.sp,
@@ -483,7 +672,7 @@ class MainActivity : ComponentActivity() {
                         Text("Brak aktywnych plików w sieci", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                         Spacer(Modifier.height(4.dp))
                         Text(
-                            "Uruchom LAN Drop na komputerze i wrzuć pliki do wrzutni.",
+                            "Uruchom LAN Drop na komputerze i wrzuć pliki lub linki do wrzutni.",
                             color = TextMuted,
                             fontSize = 12.sp
                         )
@@ -495,10 +684,21 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(allRemoteFiles, key = { it.peerDeviceId + it.id }) { item ->
+                        val isLink = item.type == "link"
+                        val linkUrl = item.content ?: item.name
+
                         Card(
                             colors = CardDefaults.cardColors(containerColor = DarkCard),
                             shape = RoundedCornerShape(12.dp),
-                            border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder)
+                            border = androidx.compose.foundation.BorderStroke(1.dp, DarkBorder),
+                            modifier = Modifier.combinedClickable(
+                                onClick = {
+                                    if (isLink) onOpenLink(linkUrl) else onDownloadFile(item)
+                                },
+                                onLongClick = {
+                                    if (isLink) onCopyLink(linkUrl)
+                                }
+                            )
                         ) {
                             Row(
                                 modifier = Modifier
@@ -507,21 +707,53 @@ class MainActivity : ComponentActivity() {
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(item.name, fontWeight = FontWeight.Bold, maxLines = 1, color = Color.White, fontSize = 14.sp)
-                                    Text(
-                                        "${formatSize(item.size)} • Z: ${item.peerName}",
-                                        fontSize = 12.sp,
-                                        color = TextMuted
-                                    )
-                                }
-                                Button(
-                                    onClick = { onDownloadFile(item) },
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color.White),
-                                    shape = RoundedCornerShape(8.dp),
-                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text("Pobierz", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    Icon(
+                                        imageVector = if (isLink) Icons.Default.Link else Icons.Default.InsertDriveFile,
+                                        contentDescription = null,
+                                        tint = if (isLink) AccentGreen else TextMuted,
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                    Spacer(Modifier.width(12.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(item.name, fontWeight = FontWeight.Bold, maxLines = 1, color = Color.White, fontSize = 14.sp)
+                                        Text(
+                                            if (isLink) "Link WWW • Z: ${item.peerName}" else "${formatSize(item.size)} • Z: ${item.peerName}",
+                                            fontSize = 12.sp,
+                                            color = TextMuted
+                                        )
+                                    }
+                                }
+
+                                if (isLink) {
+                                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        IconButton(
+                                            onClick = { onCopyLink(linkUrl) },
+                                            modifier = Modifier.size(36.dp)
+                                        ) {
+                                            Icon(Icons.Default.ContentCopy, contentDescription = "Kopiuj", tint = TextMuted, modifier = Modifier.size(18.dp))
+                                        }
+                                        Button(
+                                            onClick = { onOpenLink(linkUrl) },
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                                            shape = RoundedCornerShape(8.dp),
+                                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                                        ) {
+                                            Text("Otwórz", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                        }
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = { onDownloadFile(item) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                                        shape = RoundedCornerShape(8.dp),
+                                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                                    ) {
+                                        Text("Pobierz", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                    }
                                 }
                             }
                         }

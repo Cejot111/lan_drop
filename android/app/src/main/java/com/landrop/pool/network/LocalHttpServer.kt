@@ -2,8 +2,6 @@ package com.landrop.pool.network
 
 import android.content.Context
 import com.landrop.pool.model.SharedFile
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedOutputStream
@@ -44,11 +42,11 @@ class LocalHttpServer(
                 actualPort = p
                 break
             } catch (e: Exception) {
-                // Sprobuj kolejny port
+                // Spróbuj kolejny port
             }
         }
 
-        val s = serverSocket ?: throw IllegalStateException("Nie udalo sie powiazac serwera z wolnym portem!")
+        val s = serverSocket ?: throw IllegalStateException("Nie udało się powiązać serwera z wolnym portem!")
         isRunning = true
 
         threadPool.execute {
@@ -77,16 +75,17 @@ class LocalHttpServer(
             if (parts.size < 2) return
 
             val method = parts[0]
-            val path = URLDecoder.decode(parts[1], "UTF-8")
+            val rawPath = parts[1]
+            val cleanPath = URLDecoder.decode(rawPath.substringBefore("?"), "UTF-8")
 
             if (method.equals("GET", ignoreCase = true)) {
-                if (path == "/api/pool" || path == "/api/pool/") {
+                if (cleanPath == "/api/pool" || cleanPath == "/api/pool/") {
                     servePoolJson(out)
-                } else if (path.startsWith("/api/download/")) {
-                    val fileId = path.removePrefix("/api/download/").substringBefore("?").trim('/')
+                } else if (cleanPath.startsWith("/api/download/")) {
+                    val fileId = cleanPath.removePrefix("/api/download/").trim('/')
                     serveFileDownload(fileId, out)
-                } else if (path == "/api/ping") {
-                    val body = """{"status":"ok"}""".toByteArray()
+                } else if (cleanPath == "/api/ping") {
+                    val body = """{"status":"ok"}""".toByteArray(Charsets.UTF_8)
                     writeHttpResponse(out, 200, "OK", "application/json", body.size.toLong())
                     out.write(body)
                     out.flush()
@@ -96,7 +95,7 @@ class LocalHttpServer(
                 }
             }
         } catch (e: Exception) {
-            // Zamkniecie polaczenia lub przerwany transfer
+            // Zamknięcie połączenia lub przerwany transfer
         } finally {
             try { socket.close() } catch (e: Exception) {}
         }
@@ -110,6 +109,10 @@ class LocalHttpServer(
             obj.put("name", f.name)
             obj.put("size", f.size)
             obj.put("mime", f.mime)
+            obj.put("type", f.type)
+            if (f.content != null) {
+                obj.put("content", f.content)
+            }
             jsonArray.put(obj)
         }
 
@@ -127,15 +130,30 @@ class LocalHttpServer(
     private fun serveFileDownload(fileId: String, out: BufferedOutputStream) {
         val item = sharedFiles[fileId]
         if (item == null) {
-            val msg = "Plik nie istnieje lub zostal usuniety z puli.".toByteArray()
-            writeHttpResponse(out, 404, "Not Found", "text/plain", msg.size.toLong())
+            val msg = "Element nie istnieje lub został usunięty z puli.".toByteArray(Charsets.UTF_8)
+            writeHttpResponse(out, 404, "Not Found", "text/plain; charset=utf-8", msg.size.toLong())
             out.write(msg)
             out.flush()
             return
         }
 
+        if (item.type == "link") {
+            val linkBytes = (item.content ?: item.name).toByteArray(Charsets.UTF_8)
+            writeHttpResponse(out, 200, "OK", "text/plain; charset=utf-8", linkBytes.size.toLong())
+            out.write(linkBytes)
+            out.flush()
+            return
+        }
+
+        val uri = item.uri
+        if (uri == null) {
+            writeHttpResponse(out, 404, "Not Found", "text/plain", 0)
+            out.flush()
+            return
+        }
+
         try {
-            val inputStream = context.contentResolver.openInputStream(item.uri)
+            val inputStream = context.contentResolver.openInputStream(uri)
             if (inputStream == null) {
                 writeHttpResponse(out, 500, "Error", "text/plain", 0)
                 out.flush()
@@ -149,6 +167,7 @@ class LocalHttpServer(
                 headers.append("Content-Type: ${item.mime}\r\n")
                 headers.append("Content-Length: ${item.size}\r\n")
                 headers.append("Content-Disposition: attachment; filename=\"$safeName\"\r\n")
+                headers.append("Cache-Control: no-cache, no-store, must-revalidate\r\n")
                 headers.append("Access-Control-Allow-Origin: *\r\n")
                 headers.append("Connection: close\r\n\r\n")
 
@@ -164,7 +183,7 @@ class LocalHttpServer(
                 out.flush()
             }
         } catch (e: Exception) {
-            // Przerwano polaczenie przez odbiorce
+            // Przerwano połączenie przez odbiorcę
         }
     }
 
@@ -172,6 +191,7 @@ class LocalHttpServer(
         val headers = "HTTP/1.1 $code $status\r\n" +
                 "Content-Type: $mime\r\n" +
                 "Content-Length: $length\r\n" +
+                "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
                 "Access-Control-Allow-Origin: *\r\n" +
                 "Connection: close\r\n\r\n"
         out.write(headers.toByteArray(Charsets.UTF_8))

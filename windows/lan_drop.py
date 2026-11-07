@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-LAN Drop Pool - Aplikacja do szybkiej wymiany plików w sieci lokalnej (LAN / Wi-Fi).
+LAN Drop Pool - Aplikacja do szybkiej wymiany plików i linków w sieci lokalnej (LAN / Wi-Fi).
 Stylistyka: Pure Black (OLED / Stealth Dark), zero zbędnych funkcji, maksymalna wydajność.
+Obsługa: Wrzutnia Drag & Drop, udostępnianie linków WWW, Hotspot Wi-Fi z kodem QR,
+dwukierunkowa synchronizacja UDP Unicast + Broadcast + HTTP TCP sync.
 """
 
 import sys
@@ -17,6 +19,7 @@ import subprocess
 import io
 import urllib.request
 import urllib.error
+import webbrowser
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse, parse_qs
@@ -28,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QFileDialog, QMessageBox, QSplitter, QFrame,
-    QScrollArea, QSizePolicy, QInputDialog, QDialog
+    QScrollArea, QSizePolicy, QInputDialog, QDialog, QLineEdit
 )
 
 BROADCAST_PORT = 45454
@@ -56,6 +59,29 @@ def get_local_ip():
         s.close()
     return ip
 
+def get_all_local_ips():
+    """Zwraca wszystkie aktywne adresy IPv4 z kart sieciowych (Wi-Fi, Hotspot, Ethernet)."""
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('1.1.1.1', 80))
+        ips.add(s.getsockname()[0])
+        s.close()
+    except Exception:
+        pass
+
+    try:
+        host_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+        for ip in host_ips:
+            if not ip.startswith('127.'):
+                ips.add(ip)
+    except Exception:
+        pass
+
+    if not ips:
+        ips.add('127.0.0.1')
+    return list(ips)
+
 def get_download_folder():
     dl_path = Path.home() / "Downloads" / "LanDrop"
     dl_path.mkdir(parents=True, exist_ok=True)
@@ -63,7 +89,7 @@ def get_download_folder():
 
 
 # =====================================================================
-# MOBILNA STRONA WWW (TRYB 1: SZYBKI ZRZUT DLA DOWOLNEGO TELEFONU)
+# MOBILNA STRONA WWW (DLA DOWOLNEGO TELEFONU BEZ APLIKACJI)
 # =====================================================================
 
 MOBILE_WEB_HTML = """<!DOCTYPE html>
@@ -146,6 +172,30 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
     height: 100%;
     cursor: pointer;
   }
+  .input-text {
+    width: 100%;
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 10px;
+    color: #ffffff;
+    padding: 12px 14px;
+    font-size: 14px;
+    outline: none;
+    margin-bottom: 10px;
+  }
+  .input-text:focus { border-color: #ffffff; }
+  .btn-link {
+    background: #27272a;
+    color: #ffffff;
+    font-weight: 700;
+    font-size: 14px;
+    padding: 12px;
+    border-radius: 10px;
+    border: 1px solid #3f3f46;
+    width: 100%;
+    cursor: pointer;
+  }
+  .btn-link:active { background: #3f3f46; }
   .progress-wrap {
     background: #18181b;
     border-radius: 8px;
@@ -198,6 +248,20 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
     border: 1px solid #3f3f46;
     white-space: nowrap;
     margin-left: 12px;
+    display: inline-block;
+  }
+  .btn-open {
+    background: #ffffff;
+    color: #000000;
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 700;
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: none;
+    white-space: nowrap;
+    margin-left: 12px;
+    display: inline-block;
   }
   .empty-note {
     text-align: center;
@@ -226,7 +290,14 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <div class="card-title">Pliki wystawione na komputerze</div>
+    <div class="card-title">Wyślij link WWW do komputera</div>
+    <input type="url" id="linkIn" class="input-text" placeholder="Wklej link https://...">
+    <button class="btn-link" onclick="sendLink()">Wyślij link do komputera</button>
+    <div class="status-msg" id="linkMsg"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Pula wystawiona na komputerze</div>
     <div id="fileContainer">
       <div class="empty-note">Ładowanie puli...</div>
     </div>
@@ -242,20 +313,50 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
 
     async function fetchPool() {
       try {
-        const res = await fetch('/api/pool');
+        const res = await fetch('/api/pool?t=' + Date.now(), { cache: 'no-store' });
         const data = await res.json();
         const box = document.getElementById('fileContainer');
         if (!data.files || data.files.length === 0) {
-          box.innerHTML = '<div class="empty-note">Pula komputera jest pusta.<br>Przeciągnij pliki do programu na komputerze.</div>';
+          box.innerHTML = '<div class="empty-note">Pula komputera jest pusta.<br>Przeciągnij pliki lub dodaj link w programie na komputerze.</div>';
           return;
         }
         let html = '';
         for (let f of data.files) {
-          html += '<div class="file-item"><div><div class="file-name">' + f.name + '</div><div class="file-size">' + fmt(f.size) + '</div></div><a class="btn-dl" href="/api/download/' + f.id + '" download="' + f.name + '">Pobierz</a></div>';
+          if (f.type === 'link') {
+            const url = f.content || f.name;
+            html += '<div class="file-item"><div><div class="file-name">🔗 ' + escapeHtml(f.name) + '</div><div class="file-size">Link WWW</div></div><a class="btn-open" href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">Otwórz ↗</a></div>';
+          } else {
+            html += '<div class="file-item"><div><div class="file-name">📄 ' + escapeHtml(f.name) + '</div><div class="file-size">' + fmt(f.size) + '</div></div><a class="btn-dl" href="/api/download/' + f.id + '" download="' + escapeHtml(f.name) + '">Pobierz</a></div>';
+          }
         }
         box.innerHTML = html;
       } catch (e) {
         document.getElementById('fileContainer').innerHTML = '<div class="empty-note">Brak połączenia z komputerem.</div>';
+      }
+    }
+
+    function escapeHtml(str) {
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    async function sendLink() {
+      const input = document.getElementById('linkIn');
+      const val = input.value.trim();
+      const msg = document.getElementById('linkMsg');
+      if (!val) return;
+      try {
+        msg.innerText = 'Wysyłanie linku...';
+        const res = await fetch('/api/upload_link?url=' + encodeURIComponent(val), { method: 'POST' });
+        if (res.ok) {
+          msg.innerText = '✅ Link przesłany na komputer!';
+          input.value = '';
+          setTimeout(() => { msg.innerText = ''; }, 3000);
+          fetchPool();
+        } else {
+          msg.innerText = '❌ Błąd wysyłania linku.';
+        }
+      } catch (e) {
+        msg.innerText = '❌ Błąd połączenia.';
       }
     }
 
@@ -290,7 +391,7 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
     }
 
     fetchPool();
-    setInterval(fetchPool, 2500);
+    setInterval(fetchPool, 2000);
   </script>
 </body>
 </html>
@@ -298,25 +399,39 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
 
 
 # =====================================================================
-# PULA PLIKÓW I SERWER HTTP
+# PULA ELEMENTÓW (PLIKI + LINKI) I SERWER HTTP
 # =====================================================================
 
 class SharedItem:
-    def __init__(self, file_path: str):
-        self.path = os.path.abspath(file_path)
-        self.name = os.path.basename(self.path)
-        self.size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+    def __init__(self, file_path: str = None, link_url: str = None):
         self.id = str(uuid.uuid4())
-        mime, _ = mimetypes.guess_type(self.path)
-        self.mime = mime or "application/octet-stream"
+        if link_url:
+            self.type = "link"
+            self.path = None
+            self.name = link_url.strip()
+            self.content = link_url.strip()
+            self.size = len(self.name.encode('utf-8'))
+            self.mime = "text/x-uri"
+        else:
+            self.type = "file"
+            self.path = os.path.abspath(file_path)
+            self.name = os.path.basename(self.path)
+            self.content = None
+            self.size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
+            mime, _ = mimetypes.guess_type(self.path)
+            self.mime = mime or "application/octet-stream"
 
     def to_dict(self):
-        return {
+        d = {
             "id": self.id,
             "name": self.name,
             "size": self.size,
-            "mime": self.mime
+            "mime": self.mime,
+            "type": self.type
         }
+        if self.content:
+            d["content"] = self.content
+        return d
 
 class PoolManager:
     def __init__(self):
@@ -329,13 +444,27 @@ class PoolManager:
         with self.lock:
             for p in paths:
                 if os.path.isfile(p):
-                    if not any(item.path == os.path.abspath(p) for item in self.files.values()):
-                        item = SharedItem(p)
+                    if not any(item.path == os.path.abspath(p) for item in self.files.values() if item.type == "file"):
+                        item = SharedItem(file_path=p)
                         self.files[item.id] = item
                         added.append(item)
             if added:
                 self.version += 1
         return added
+
+    def add_link(self, url: str):
+        url = url.strip()
+        if not url:
+            return None
+        with self.lock:
+            # Nie dodawaj duplikatów tego samego linku
+            for item in self.files.values():
+                if item.type == "link" and item.content == url:
+                    return item
+            item = SharedItem(link_url=url)
+            self.files[item.id] = item
+            self.version += 1
+            return item
 
     def remove_file(self, file_id):
         with self.lock:
@@ -374,19 +503,21 @@ class HttpFileHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         pool = self.server.pool_manager
-        path = unquote(self.path)
+        parsed = urlparse(self.path)
+        req_path = unquote(parsed.path)
 
-        if path == "/" or path == "/index.html":
+        if req_path in ("/", "/index.html"):
             body = MOBILE_WEB_HTML.encode('utf-8')
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
             return
 
-        if path == "/api/pool" or path == "/api/pool/":
+        if req_path in ("/api/pool", "/api/pool/"):
             data = {
                 "deviceId": self.server.device_id,
                 "deviceName": self.server.device_name,
@@ -397,18 +528,38 @@ class HttpFileHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
             return
 
-        if path.startswith("/api/download/"):
-            file_id = path[len("/api/download/"):].split("?")[0].strip("/")
+        if req_path.startswith("/api/download/"):
+            file_id = req_path[len("/api/download/"):].strip("/")
             item = pool.get_item(file_id)
-            if not item or not os.path.exists(item.path):
+            if not item:
                 self.send_response(404)
                 self.end_headers()
-                self.wfile.write(b"Plik nie istnieje lub zostal usuniety z puli.")
+                self.wfile.write(b"Element nie istnieje lub zostal usuniety z puli.")
+                return
+
+            if item.type == "link":
+                body = (item.content or item.name).encode('utf-8')
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if not os.path.exists(item.path):
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Plik nie istnieje na dysku.")
                 return
 
             try:
@@ -418,6 +569,7 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(file_size))
                 safe_name = item.name.replace('"', '\\"')
                 self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
 
@@ -430,9 +582,10 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                 print(f"[HTTP] Blad strumieniowania: {e}")
             return
 
-        if path == "/api/ping":
+        if req_path == "/api/ping":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(b'{"status":"ok"}')
             return
@@ -480,6 +633,34 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                 self.wfile.write(str(e).encode('utf-8'))
             return
 
+        if parsed.path == "/api/upload_link":
+            qs = parse_qs(parsed.query)
+            link_url = qs.get("url", [""])[0]
+            if not link_url:
+                try:
+                    content_length = int(self.headers.get("Content-Length", 0))
+                    raw_body = self.rfile.read(content_length).decode('utf-8')
+                    body_json = json.loads(raw_body)
+                    link_url = body_json.get("url", "")
+                except Exception:
+                    pass
+
+            if link_url:
+                if hasattr(self.server, "on_link_received") and self.server.on_link_received:
+                    self.server.on_link_received(link_url)
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(b'{"status":"ok"}')
+                return
+            else:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b'{"error":"Brak parametru url"}')
+                return
+
         self.send_response(404)
         self.end_headers()
 
@@ -493,6 +674,7 @@ class LocalServer:
         self.server = None
         self.thread = None
         self.on_file_received = None
+        self.on_link_received = None
 
     def start(self):
         for p in range(self.port, self.port + 50):
@@ -502,6 +684,7 @@ class LocalServer:
                 self.server.device_id = self.device_id
                 self.server.device_name = self.device_name
                 self.server.on_file_received = self.on_file_received
+                self.server.on_link_received = self.on_link_received
                 self.port = p
                 break
             except OSError:
@@ -520,7 +703,7 @@ class LocalServer:
 
 
 # =====================================================================
-# SYSTEM ODKRYWANIA URZĄDZEŃ W SIECI (UDP BROADCAST)
+# SYSTEM ODKRYWANIA URZĄDZEŃ W SIECI (UDP BROADCAST + UNICAST + TCP SYNC)
 # =====================================================================
 
 class LanDiscovery(QThread):
@@ -534,26 +717,22 @@ class LanDiscovery(QThread):
         self.pool = pool_manager
         self.running = True
         self.peers = {}
+        self.known_peer_ips = set()
         self.lock = threading.Lock()
 
     def run(self):
         rx_thread = threading.Thread(target=self._listen_loop, daemon=True)
         rx_thread.start()
 
+        tcp_thread = threading.Thread(target=self._tcp_poll_loop, daemon=True)
+        tcp_thread.start()
+
         while self.running:
             self._send_beacon("beacon")
             self._prune_peers()
             time.sleep(2)
 
-    def _get_broadcast_addresses(self):
-        addresses = ['255.255.255.255']
-        local_ip = get_local_ip()
-        parts = local_ip.split('.')
-        if len(parts) == 4 and parts[0] != '127':
-            addresses.append(f"{parts[0]}.{parts[1]}.{parts[2]}.255")
-        return list(set(addresses))
-
-    def _send_beacon(self, msg_type="beacon"):
+    def _send_beacon(self, msg_type="beacon", target_ip=None):
         payload = {
             "type": msg_type,
             "deviceId": self.device_id,
@@ -564,28 +743,66 @@ class LanDiscovery(QThread):
             "files": self.pool.get_list()
         }
         data = json.dumps(payload).encode('utf-8')
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.settimeout(0.5)
 
-        for bcast_ip in self._get_broadcast_addresses():
+        local_ips = get_all_local_ips()
+        for lip in local_ips:
             try:
-                sock.sendto(data, (bcast_ip, BROADCAST_PORT))
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.settimeout(0.3)
+                sock.bind((lip, 0))
+
+                if target_ip:
+                    # Wysyłka unicast do konkretnego adresu
+                    sock.sendto(data, (target_ip, BROADCAST_PORT))
+                else:
+                    # 1. Ogólny broadcast
+                    try:
+                        sock.sendto(data, ('255.255.255.255', BROADCAST_PORT))
+                    except Exception:
+                        pass
+
+                    # 2. Subnet broadcast (np. 192.168.1.255)
+                    parts = lip.split('.')
+                    if len(parts) == 4 and parts[0] != '127':
+                        try:
+                            sock.sendto(data, (f"{parts[0]}.{parts[1]}.{parts[2]}.255", BROADCAST_PORT))
+                        except Exception:
+                            pass
+
+                    # 3. Unicast do wszystkich znanych urządzeń (omija filtry routera FunBox)
+                    with self.lock:
+                        ips_to_unicast = list(self.known_peer_ips)
+                    for pip in ips_to_unicast:
+                        try:
+                            sock.sendto(data, (pip, BROADCAST_PORT))
+                        except Exception:
+                            pass
+
+                sock.close()
             except Exception:
                 pass
-        sock.close()
 
     def send_farewell(self):
         payload = {"type": "farewell", "deviceId": self.device_id}
         data = json.dumps(payload).encode('utf-8')
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        for bcast_ip in self._get_broadcast_addresses():
+        local_ips = get_all_local_ips()
+        for lip in local_ips:
             try:
-                sock.sendto(data, (bcast_ip, BROADCAST_PORT))
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                sock.bind((lip, 0))
+                sock.sendto(data, ('255.255.255.255', BROADCAST_PORT))
+                with self.lock:
+                    ips = list(self.known_peer_ips)
+                for pip in ips:
+                    try:
+                        sock.sendto(data, (pip, BROADCAST_PORT))
+                    except Exception:
+                        pass
+                sock.close()
             except Exception:
                 pass
-        sock.close()
 
     def _listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -605,6 +822,14 @@ class LanDiscovery(QThread):
                 if not peer_id or peer_id == self.device_id:
                     continue
 
+                with self.lock:
+                    is_new = sender_ip not in self.known_peer_ips
+                    self.known_peer_ips.add(sender_ip)
+
+                # Jeśli to nowe urządzenie, natychmiast odpowiedz pakietem unicast
+                if is_new:
+                    self._send_beacon("beacon", target_ip=sender_ip)
+
                 msg_type = msg.get("type", "beacon")
                 with self.lock:
                     if msg_type == "farewell":
@@ -612,14 +837,24 @@ class LanDiscovery(QThread):
                             del self.peers[peer_id]
                             self.peers_updated.emit(dict(self.peers))
                     else:
+                        parsed_files = []
+                        for f in msg.get("files", []):
+                            parsed_files.append({
+                                "id": f.get("id"),
+                                "name": f.get("name"),
+                                "size": f.get("size", 0),
+                                "type": f.get("type", "file"),
+                                "content": f.get("content")
+                            })
+
                         self.peers[peer_id] = {
                             "last_seen": time.time(),
                             "ip": sender_ip,
-                            "deviceName": msg.get("deviceName", f"Urządzenie ({sender_ip})"),
+                            "deviceName": msg.get("deviceName", f"Telefon ({sender_ip})"),
                             "platform": msg.get("platform", "unknown"),
                             "port": msg.get("port", DEFAULT_HTTP_PORT),
                             "version": msg.get("version", 1),
-                            "files": msg.get("files", [])
+                            "files": parsed_files
                         }
                         self.peers_updated.emit(dict(self.peers))
             except socket.timeout:
@@ -628,28 +863,54 @@ class LanDiscovery(QThread):
                 continue
         sock.close()
 
-    def add_manual_peer(self, ip, port=DEFAULT_HTTP_PORT):
-        def _fetch():
-            try:
-                req = urllib.request.Request(f"http://{ip}:{port}/api/pool")
-                with urllib.request.urlopen(req, timeout=3) as resp:
-                    data = json.loads(resp.read().decode('utf-8'))
-                    pid = data.get("deviceId", ip)
-                    with self.lock:
-                        self.peers[pid] = {
-                            "last_seen": time.time(),
-                            "ip": ip,
-                            "deviceName": data.get("deviceName", f"Urządzenie ({ip})"),
-                            "platform": "manual",
-                            "port": port,
-                            "version": data.get("version", 1),
-                            "files": data.get("files", []),
-                            "is_manual": True
-                        }
-                        self.peers_updated.emit(dict(self.peers))
-            except Exception:
-                pass
-        threading.Thread(target=_fetch, daemon=True).start()
+    def _tcp_poll_loop(self):
+        """Aktywne odpytywanie TCP/HTTP co 2.5s gwarantuje 100% synchronizacji listy plików."""
+        while self.running:
+            time.sleep(2.5)
+            with self.lock:
+                peers_to_check = [(p["ip"], p.get("port", DEFAULT_HTTP_PORT), pid) for pid, p in self.peers.items()]
+                known_ips = list(self.known_peer_ips)
+
+            for ip, port, pid in peers_to_check:
+                self._fetch_peer_http(ip, port, pid)
+
+            for ip in known_ips:
+                if not any(ip == p[0] for p in peers_to_check):
+                    self._fetch_peer_http(ip, DEFAULT_HTTP_PORT, None)
+
+    def _fetch_peer_http(self, ip, port, expected_pid):
+        try:
+            req = urllib.request.Request(f"http://{ip}:{port}/api/pool?t={int(time.time()*1000)}")
+            req.add_header("Cache-Control", "no-cache")
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                pid = data.get("deviceId", ip)
+                if pid == self.device_id:
+                    return
+
+                parsed_files = []
+                for f in data.get("files", []):
+                    parsed_files.append({
+                        "id": f.get("id"),
+                        "name": f.get("name"),
+                        "size": f.get("size", 0),
+                        "type": f.get("type", "file"),
+                        "content": f.get("content")
+                    })
+
+                with self.lock:
+                    self.peers[pid] = {
+                        "last_seen": time.time(),
+                        "ip": ip,
+                        "deviceName": data.get("deviceName", f"Telefon ({ip})"),
+                        "platform": "http_sync",
+                        "port": port,
+                        "version": data.get("version", 1),
+                        "files": parsed_files
+                    }
+                    self.peers_updated.emit(dict(self.peers))
+        except Exception:
+            pass
 
     def _prune_peers(self):
         now = time.time()
@@ -657,12 +918,7 @@ class LanDiscovery(QThread):
         with self.lock:
             to_delete = []
             for pid, peer in self.peers.items():
-                if peer.get("is_manual"):
-                    if now - peer["last_seen"] > 3.0:
-                        peer["last_seen"] = now
-                        self.add_manual_peer(peer["ip"], peer.get("port", DEFAULT_HTTP_PORT))
-                    continue
-                if now - peer["last_seen"] > 6.0:
+                if now - peer["last_seen"] > 8.0:
                     to_delete.append(pid)
             for pid in to_delete:
                 del self.peers[pid]
@@ -708,7 +964,8 @@ class DownloadWorker(QThread):
 
         try:
             req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=10) as resp, open(save_path, "wb") as out_file:
+            req.add_header("Cache-Control", "no-cache")
+            with urllib.request.urlopen(req, timeout=12) as resp, open(save_path, "wb") as out_file:
                 total_bytes = int(resp.headers.get("Content-Length", self.file_size))
                 downloaded = 0
                 chunk_size = 512 * 1024
@@ -881,42 +1138,24 @@ class DropZoneWidget(QFrame):
 
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setContentsMargins(20, 36, 20, 36)
-        layout.setSpacing(8)
+        layout.setContentsMargins(20, 28, 20, 28)
+        layout.setSpacing(6)
 
         self.icon_label = QLabel("📥")
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.icon_label.setStyleSheet("font-size: 38px; background: transparent;")
+        self.icon_label.setStyleSheet("font-size: 34px; background: transparent;")
 
         self.text_label = QLabel("PRZECIĄGNIJ I UPUSZĆ PLIKI")
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setStyleSheet("font-size: 14px; font-weight: 800; letter-spacing: 0.5px; color: #ffffff; background: transparent;")
 
-        self.sub_label = QLabel("Pliki zawisną w sieci i będą widoczne dla innych komputerów i telefonu")
+        self.sub_label = QLabel("Pliki natychmiast pojawią się w puli telefonu")
         self.sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sub_label.setStyleSheet("font-size: 12px; color: #71717a; background: transparent;")
-
-        self.browse_btn = QPushButton("Wybierz pliki...")
-        self.browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.browse_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #ffffff;
-                color: #000000;
-                font-weight: 700;
-                font-size: 13px;
-                padding: 10px 22px;
-                border-radius: 8px;
-                border: none;
-            }
-            QPushButton:hover { background-color: #e4e4e7; }
-        """)
-        self.browse_btn.clicked.connect(self.choose_files)
 
         layout.addWidget(self.icon_label)
         layout.addWidget(self.text_label)
         layout.addWidget(self.sub_label)
-        layout.addSpacing(6)
-        layout.addWidget(self.browse_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
         self.set_idle_style()
 
@@ -925,7 +1164,7 @@ class DropZoneWidget(QFrame):
             #DropZone {
                 background-color: #09090b;
                 border: 2px dashed #27272a;
-                border-radius: 14px;
+                border-radius: 12px;
             }
         """)
 
@@ -934,7 +1173,7 @@ class DropZoneWidget(QFrame):
             #DropZone {
                 background-color: #121214;
                 border: 2px dashed #10b981;
-                border-radius: 14px;
+                border-radius: 12px;
             }
         """)
 
@@ -961,11 +1200,6 @@ class DropZoneWidget(QFrame):
         if paths:
             self.files_dropped.emit(paths)
 
-    def choose_files(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Wybierz pliki do udostępnienia")
-        if files:
-            self.files_dropped.emit(files)
-
 
 # =====================================================================
 # GŁÓWNE OKNO APLIKACJI (PURE BLACK STEALTH DESIGN)
@@ -975,8 +1209,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
-        self.resize(1120, 740)
-        self.setMinimumSize(920, 600)
+        self.resize(1140, 750)
+        self.setMinimumSize(940, 600)
 
         self.device_id = str(uuid.uuid4())[:8]
         self.hostname = socket.gethostname()
@@ -991,6 +1225,7 @@ class MainWindow(QMainWindow):
         self.pool = PoolManager()
         self.server = LocalServer(self.pool, self.device_id, self.device_name)
         self.server.on_file_received = self.on_web_file_received
+        self.server.on_link_received = self.on_web_link_received
         self.server.start()
 
         self.discovery = LanDiscovery(self.device_id, self.device_name, self.server.port, self.pool)
@@ -1004,8 +1239,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(16)
+        main_layout.setContentsMargins(18, 18, 18, 18)
+        main_layout.setSpacing(14)
 
         # 1. Pasek górny (Dashboard Header)
         header = QFrame()
@@ -1035,14 +1270,14 @@ class MainWindow(QMainWindow):
         h_layout.addLayout(title_box)
         h_layout.addStretch()
 
-        # Przyciski akcji (proste, czytelne, nieucięte)
+        # Przyciski akcji
         actions = QHBoxLayout()
         actions.setSpacing(8)
 
-        # Przycisk: Szybki zrzut WWW (QR dla każdego telefonu)
+        # Przycisk: Szybki zrzut WWW (QR dla dowolnego telefonu)
         self.web_btn = QPushButton("📱 Szybki zrzut (QR)")
         self.web_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.web_btn.setToolTip("Otwórz wrzutnię na telefonie przez przeglądarkę bez instalowania aplikacji")
+        self.web_btn.setToolTip("Otwórz stronę wrzutni na telefonie bez instalacji aplikacji")
         self.web_btn.setStyleSheet("""
             QPushButton {
                 background-color: #18181b;
@@ -1058,7 +1293,7 @@ class MainWindow(QMainWindow):
         self.web_btn.clicked.connect(self.show_web_dialog)
         actions.addWidget(self.web_btn)
 
-        # Przycisk: Włącz Hotspot
+        # Przycisk: Hotspot Wi-Fi
         self.hotspot_btn = QPushButton("📶 Hotspot Wi-Fi")
         self.hotspot_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.set_hotspot_btn_idle()
@@ -1095,13 +1330,49 @@ class MainWindow(QMainWindow):
         left_panel.setStyleSheet("background-color: #000000; border: 1px solid #1f1f23; border-radius: 14px;")
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(16, 16, 16, 16)
-        left_layout.setSpacing(12)
+        left_layout.setSpacing(10)
 
         left_head = QHBoxLayout()
-        l_title = QLabel("TWOJA PULA")
-        l_title.setStyleSheet("font-size: 12px; font-weight: 800; letter-spacing: 1px; color: #ffffff;")
+        l_title = QLabel("TWOJA PULA (WYSTAWIONE DLA TELEFONU)")
+        l_title.setStyleSheet("font-size: 11px; font-weight: 800; letter-spacing: 1px; color: #a1a1aa;")
         left_head.addWidget(l_title)
         left_head.addStretch()
+
+        # Przyciski szybkiego dodawania
+        add_files_btn = QPushButton("➕ Dodaj pliki")
+        add_files_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_files_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                color: #000000;
+                font-weight: 700;
+                font-size: 12px;
+                padding: 6px 14px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #e4e4e7; }
+        """)
+        add_files_btn.clicked.connect(self.choose_files)
+        left_head.addWidget(add_files_btn)
+
+        add_link_btn = QPushButton("🔗 Dodaj link")
+        add_link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_link_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #ffffff;
+                font-weight: 700;
+                font-size: 12px;
+                padding: 6px 14px;
+                border-radius: 6px;
+                border: 1px solid #27272a;
+            }
+            QPushButton:hover { background-color: #27272a; }
+        """)
+        add_link_btn.clicked.connect(self.prompt_add_link)
+        left_head.addWidget(add_link_btn)
+
         left_layout.addLayout(left_head)
 
         # Strefa DropZone
@@ -1109,9 +1380,9 @@ class MainWindow(QMainWindow):
         self.drop_zone.files_dropped.connect(self.add_files_to_pool)
         left_layout.addWidget(self.drop_zone)
 
-        # Tabela plików
+        # Tabela plików Twojej puli
         self.my_table = QTableWidget(0, 3)
-        self.my_table.setHorizontalHeaderLabels(["Nazwa pliku", "Rozmiar", ""])
+        self.my_table.setHorizontalHeaderLabels(["Plik / Link WWW", "Rozmiar", ""])
         self.my_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.my_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.my_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -1121,7 +1392,7 @@ class MainWindow(QMainWindow):
 
         # Pasek podsumowania lewego panelu
         left_foot = QHBoxLayout()
-        self.my_summary_lbl = QLabel("W puli: 0 plików")
+        self.my_summary_lbl = QLabel("W puli: 0 elementów")
         self.my_summary_lbl.setStyleSheet("color: #71717a; font-size: 12px; font-weight: 500;")
 
         self.clear_my_pool_btn = QPushButton("Wyczyść pulę")
@@ -1145,23 +1416,23 @@ class MainWindow(QMainWindow):
         left_foot.addWidget(self.clear_my_pool_btn)
         left_layout.addLayout(left_foot)
 
-        # PANEL PRAWY: PLIKI W SIECI
+        # PANEL PRAWY: ELEMENTY W SIECI
         right_panel = QFrame()
         right_panel.setStyleSheet("background-color: #000000; border: 1px solid #1f1f23; border-radius: 14px;")
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(16, 16, 16, 16)
-        right_layout.setSpacing(12)
+        right_layout.setSpacing(10)
 
         right_head = QHBoxLayout()
-        r_title = QLabel("PLIKI W SIECI (Z TELEFONU / INNYCH PC)")
-        r_title.setStyleSheet("font-size: 12px; font-weight: 800; letter-spacing: 1px; color: #ffffff;")
+        r_title = QLabel("PLIKI I LINKI W SIECI (Z TELEFONU / INNYCH PC)")
+        r_title.setStyleSheet("font-size: 11px; font-weight: 800; letter-spacing: 1px; color: #a1a1aa;")
         right_head.addWidget(r_title)
         right_head.addStretch()
         right_layout.addLayout(right_head)
 
         # Tabela sieciowa
         self.net_table = QTableWidget(0, 4)
-        self.net_table.setHorizontalHeaderLabels(["Urządzenie", "Nazwa pliku", "Rozmiar", "Akcja"])
+        self.net_table.setHorizontalHeaderLabels(["Urządzenie", "Nazwa / Link WWW", "Rozmiar", "Akcja"])
         self.net_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.net_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.net_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -1181,12 +1452,12 @@ class MainWindow(QMainWindow):
 
         # 3. Pasek statusu
         status_bar = QHBoxLayout()
-        self.status_lbl = QLabel("Gotowy. Przeciągnij pliki do lewego panelu.")
+        self.status_lbl = QLabel("Gotowy. Przeciągnij pliki do lewego panelu lub kliknij 'Dodaj link'.")
         self.status_lbl.setStyleSheet("color: #71717a; font-size: 12px;")
         status_bar.addWidget(self.status_lbl)
         status_bar.addStretch()
 
-        tip_lbl = QLabel("Pliki znikną z sieci po zamknięciu programu")
+        tip_lbl = QLabel("Elementy znikną z sieci po zamknięciu programu")
         tip_lbl.setStyleSheet("color: #52525b; font-size: 11px;")
         status_bar.addWidget(tip_lbl)
 
@@ -1368,9 +1639,30 @@ class MainWindow(QMainWindow):
         fname = os.path.basename(save_path)
         QTimer.singleShot(0, lambda: self.status_lbl.setText(f"Otrzymano plik z telefonu: {fname} (zapisano w Downloads/LanDrop)"))
 
+    def on_web_link_received(self, link_url):
+        item = self.pool.add_link(link_url)
+        if item:
+            QTimer.singleShot(0, lambda: self.refresh_my_pool_ui())
+            QTimer.singleShot(0, lambda: self.status_lbl.setText(f"Otrzymano link z telefonu: {link_url}"))
+            self.discovery._send_beacon("beacon")
+
     # =================================================================
-    # OBSŁUGA TWOJEJ PULI
+    # OBSŁUGA TWOJEJ PULI (PLIKI I LINKI)
     # =================================================================
+
+    def choose_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Wybierz pliki do udostępnienia")
+        if files:
+            self.add_files_to_pool(files)
+
+    def prompt_add_link(self):
+        url, ok = QInputDialog.getText(self, "Udostępnij link WWW", "Wklej adres URL do zawieszenia w puli:")
+        if ok and url.strip():
+            item = self.pool.add_link(url.strip())
+            if item:
+                self.refresh_my_pool_ui()
+                self.status_lbl.setText(f"Dodano link do puli: {url.strip()}")
+                self.discovery._send_beacon("beacon")
 
     def add_files_to_pool(self, paths):
         added = self.pool.add_files(paths)
@@ -1382,7 +1674,7 @@ class MainWindow(QMainWindow):
     def remove_from_my_pool(self, file_id):
         if self.pool.remove_file(file_id):
             self.refresh_my_pool_ui()
-            self.status_lbl.setText("Usunięto plik z Twojej puli.")
+            self.status_lbl.setText("Usunięto element z Twojej puli.")
             self.discovery._send_beacon("beacon")
 
     def clear_my_pool(self):
@@ -1398,11 +1690,14 @@ class MainWindow(QMainWindow):
         self.my_table.setRowCount(len(files))
 
         for row, f in enumerate(files):
-            name_item = QTableWidgetItem(f["name"])
+            is_link = f.get("type") == "link"
+            prefix = "🔗 " if is_link else "📄 "
+            name_item = QTableWidgetItem(prefix + f["name"])
             name_item.setToolTip(f["name"])
             self.my_table.setItem(row, 0, name_item)
 
-            size_item = QTableWidgetItem(format_size(f["size"]))
+            size_text = "Link WWW" if is_link else format_size(f["size"])
+            size_item = QTableWidgetItem(size_text)
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.my_table.setItem(row, 1, size_item)
 
@@ -1423,10 +1718,16 @@ class MainWindow(QMainWindow):
             del_btn.clicked.connect(lambda _, fid=f["id"]: self.remove_from_my_pool(fid))
             self.my_table.setCellWidget(row, 2, del_btn)
 
-        self.my_summary_lbl.setText(f"W puli: {self.pool.count()} plików ({format_size(self.pool.total_size())})")
+        links_count = sum(1 for f in files if f.get("type") == "link")
+        files_count = len(files) - links_count
+        summary_str = f"W puli: {files_count} plik(ów)"
+        if links_count > 0:
+            summary_str += f", {links_count} link(ów)"
+        summary_str += f" ({format_size(self.pool.total_size())})"
+        self.my_summary_lbl.setText(summary_str)
 
     # =================================================================
-    # PLIKI W SIECI (Z APLIKACJI ANDROID LUB INNYCH KOMPUTERÓW)
+    # ELEMENTY W SIECI (Z TELEFONU / INNYCH KOMPUTERÓW)
     # =================================================================
 
     def on_peers_updated(self, peers):
@@ -1451,39 +1752,101 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(all_remote_files):
             f = item["file"]
             fid = f["id"]
+            is_link = f.get("type") == "link"
+            link_url = f.get("content") or f.get("name")
 
             dev_item = QTableWidgetItem(item["deviceName"])
             self.net_table.setItem(row, 0, dev_item)
 
-            name_item = QTableWidgetItem(f["name"])
+            prefix = "🔗 " if is_link else "📄 "
+            name_item = QTableWidgetItem(prefix + f["name"])
             name_item.setToolTip(f["name"])
             self.net_table.setItem(row, 1, name_item)
 
-            size_item = QTableWidgetItem(format_size(f["size"]))
+            size_text = "Link WWW" if is_link else format_size(f["size"])
+            size_item = QTableWidgetItem(size_text)
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.net_table.setItem(row, 2, size_item)
 
-            if fid in self.active_downloads:
-                status_lbl = QLabel("Pobieranie...")
-                status_lbl.setStyleSheet("color: #10b981; font-weight: bold;")
-                self.net_table.setCellWidget(row, 3, status_lbl)
-            else:
-                dl_btn = QPushButton("Pobierz")
-                dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                dl_btn.setStyleSheet("""
+            if is_link:
+                # Widżet akcji dla linku (Otwórz w przeglądarce + Kopiuj do schowka)
+                act_box = QWidget()
+                act_lay = QHBoxLayout(act_box)
+                act_lay.setContentsMargins(0, 0, 0, 0)
+                act_lay.setSpacing(6)
+
+                open_btn = QPushButton("🌐 Otwórz")
+                open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                open_btn.setStyleSheet("""
                     QPushButton {
                         background-color: #ffffff;
                         color: #000000;
                         font-weight: 700;
-                        padding: 6px 14px;
+                        padding: 5px 12px;
                         border-radius: 6px;
                         border: none;
                         font-size: 12px;
                     }
                     QPushButton:hover { background-color: #e4e4e7; }
                 """)
-                dl_btn.clicked.connect(lambda _, item=item: self.start_download(item))
-                self.net_table.setCellWidget(row, 3, dl_btn)
+                open_btn.clicked.connect(lambda _, u=link_url: self.open_link(u))
+
+                copy_btn = QPushButton("📋")
+                copy_btn.setToolTip("Kopiuj link do schowka")
+                copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                copy_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #18181b;
+                        color: #ffffff;
+                        padding: 5px 8px;
+                        border-radius: 6px;
+                        border: 1px solid #27272a;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover { background-color: #27272a; }
+                """)
+                copy_btn.clicked.connect(lambda _, u=link_url: self.copy_link(u))
+
+                act_lay.addWidget(open_btn)
+                act_lay.addWidget(copy_btn)
+                self.net_table.setCellWidget(row, 3, act_box)
+
+            else:
+                if fid in self.active_downloads:
+                    status_lbl = QLabel("Pobieranie...")
+                    status_lbl.setStyleSheet("color: #10b981; font-weight: bold;")
+                    self.net_table.setCellWidget(row, 3, status_lbl)
+                else:
+                    dl_btn = QPushButton("⬇ Pobierz")
+                    dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    dl_btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #ffffff;
+                            color: #000000;
+                            font-weight: 700;
+                            padding: 6px 14px;
+                            border-radius: 6px;
+                            border: none;
+                            font-size: 12px;
+                        }
+                        QPushButton:hover { background-color: #e4e4e7; }
+                    """)
+                    dl_btn.clicked.connect(lambda _, item=item: self.start_download(item))
+                    self.net_table.setCellWidget(row, 3, dl_btn)
+
+    def open_link(self, url):
+        target = url
+        if not target.startswith("http://") and not target.startswith("https://"):
+            target = "https://" + target
+        try:
+            webbrowser.open(target)
+            self.status_lbl.setText(f"Otwarto w przeglądarce: {target}")
+        except Exception as e:
+            QMessageBox.warning(self, "Błąd", f"Nie można otworzyć linku: {e}")
+
+    def copy_link(self, url):
+        QApplication.clipboard().setText(url)
+        self.status_lbl.setText(f"Skopiowano link do schowka: {url}")
 
     def start_download(self, item):
         f = item["file"]
