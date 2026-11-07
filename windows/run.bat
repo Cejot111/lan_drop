@@ -1,5 +1,6 @@
 @echo off
 title LAN Drop Pool
+cd /d "%~dp0"
 echo ========================================================
 echo        LAN Drop Pool - Szybki Transfer Lokalny
 echo ========================================================

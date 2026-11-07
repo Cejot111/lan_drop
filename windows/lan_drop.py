@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QFileDialog, QMessageBox, QSplitter, QFrame,
-    QScrollArea, QSizePolicy, QInputDialog, QDialog, QLineEdit
+    QScrollArea, QSizePolicy, QInputDialog, QDialog, QLineEdit, QCheckBox
 )
 
 BROADCAST_PORT = 45454
@@ -1221,6 +1221,7 @@ class MainWindow(QMainWindow):
         self.hotspot_started_by_us = False
         self.hotspot_worker = None
         self.active_downloads = {}
+        self.row_checkboxes = []
 
         self.pool = PoolManager()
         self.server = LocalServer(self.pool, self.device_id, self.device_name)
@@ -1424,19 +1425,73 @@ class MainWindow(QMainWindow):
         right_layout.setSpacing(10)
 
         right_head = QHBoxLayout()
-        r_title = QLabel("PLIKI I LINKI W SIECI (Z TELEFONU / INNYCH PC)")
+        right_head.setSpacing(6)
+        r_title = QLabel("PLIKI I LINKI W SIECI")
         r_title.setStyleSheet("font-size: 11px; font-weight: 800; letter-spacing: 1px; color: #a1a1aa;")
         right_head.addWidget(r_title)
         right_head.addStretch()
+
+        self.select_all_btn = QPushButton("☑ Zaznacz wszystko")
+        self.select_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #ffffff;
+                font-weight: 700;
+                font-size: 11px;
+                padding: 5px 10px;
+                border-radius: 6px;
+                border: 1px solid #27272a;
+            }
+            QPushButton:hover { background-color: #27272a; border-color: #3f3f46; }
+        """)
+        self.select_all_btn.clicked.connect(self.toggle_select_all)
+        right_head.addWidget(self.select_all_btn)
+
+        self.dl_selected_btn = QPushButton("⬇ Pobierz zaznaczone")
+        self.dl_selected_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dl_selected_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #10b981;
+                font-weight: 700;
+                font-size: 11px;
+                padding: 5px 12px;
+                border-radius: 6px;
+                border: 1px solid #27272a;
+            }
+            QPushButton:hover { background-color: #27272a; border-color: #10b981; }
+        """)
+        self.dl_selected_btn.clicked.connect(self.download_selected)
+        right_head.addWidget(self.dl_selected_btn)
+
+        self.dl_all_btn = QPushButton("⬇ Pobierz wszystkie")
+        self.dl_all_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dl_all_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ffffff;
+                color: #000000;
+                font-weight: 700;
+                font-size: 11px;
+                padding: 5px 14px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #e4e4e7; }
+        """)
+        self.dl_all_btn.clicked.connect(self.download_all)
+        right_head.addWidget(self.dl_all_btn)
+
         right_layout.addLayout(right_head)
 
-        # Tabela sieciowa
-        self.net_table = QTableWidget(0, 4)
-        self.net_table.setHorizontalHeaderLabels(["Urządzenie", "Nazwa / Link WWW", "Rozmiar", "Akcja"])
+        # Tabela sieciowa (5 kolumn: Checkbox, Urządzenie, Nazwa/Link, Rozmiar, Akcja)
+        self.net_table = QTableWidget(0, 5)
+        self.net_table.setHorizontalHeaderLabels(["", "Urządzenie", "Nazwa / Link WWW", "Rozmiar", "Akcja"])
         self.net_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.net_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.net_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.net_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.net_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.net_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.net_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.net_table.verticalHeader().setVisible(False)
         right_layout.addWidget(self.net_table)
 
@@ -1733,6 +1788,13 @@ class MainWindow(QMainWindow):
     def on_peers_updated(self, peers):
         self.peers_badge.setText(f"Urządzenia: {len(peers)}")
 
+        # Zapamiętaj dotychczas zaznaczone ID plików
+        previously_checked_ids = {
+            item["file"]["id"]
+            for cb, item in self.row_checkboxes
+            if cb.isChecked()
+        }
+
         all_remote_files = []
         for pid, peer in peers.items():
             device_name = peer.get("deviceName", "Nieznane")
@@ -1748,6 +1810,7 @@ class MainWindow(QMainWindow):
                 })
 
         self.net_table.setRowCount(len(all_remote_files))
+        self.row_checkboxes.clear()
 
         for row, item in enumerate(all_remote_files):
             f = item["file"]
@@ -1755,21 +1818,55 @@ class MainWindow(QMainWindow):
             is_link = f.get("type") == "link"
             link_url = f.get("content") or f.get("name")
 
-            dev_item = QTableWidgetItem(item["deviceName"])
-            self.net_table.setItem(row, 0, dev_item)
+            # Kolumna 0: Checkbox (tylko dla plików)
+            chk_widget = QWidget()
+            chk_lay = QHBoxLayout(chk_widget)
+            chk_lay.setContentsMargins(6, 0, 6, 0)
+            chk_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cb = QCheckBox()
+            cb.setStyleSheet("""
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 1px solid #3f3f46;
+                    border-radius: 4px;
+                    background: #18181b;
+                }
+                QCheckBox::indicator:hover {
+                    border-color: #10b981;
+                }
+                QCheckBox::indicator:checked {
+                    background-color: #10b981;
+                    border-color: #10b981;
+                }
+            """)
+            if is_link:
+                cb.setEnabled(False)
+                cb.setVisible(False)
+            else:
+                cb.setChecked(fid in previously_checked_ids)
+                self.row_checkboxes.append((cb, item))
+            chk_lay.addWidget(cb)
+            self.net_table.setCellWidget(row, 0, chk_widget)
 
+            # Kolumna 1: Urządzenie
+            dev_item = QTableWidgetItem(item["deviceName"])
+            self.net_table.setItem(row, 1, dev_item)
+
+            # Kolumna 2: Nazwa / Link WWW
             prefix = "🔗 " if is_link else "📄 "
             name_item = QTableWidgetItem(prefix + f["name"])
             name_item.setToolTip(f["name"])
-            self.net_table.setItem(row, 1, name_item)
+            self.net_table.setItem(row, 2, name_item)
 
+            # Kolumna 3: Rozmiar
             size_text = "Link WWW" if is_link else format_size(f["size"])
             size_item = QTableWidgetItem(size_text)
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.net_table.setItem(row, 2, size_item)
+            self.net_table.setItem(row, 3, size_item)
 
+            # Kolumna 4: Akcja
             if is_link:
-                # Widżet akcji dla linku (Otwórz w przeglądarce + Kopiuj do schowka)
                 act_box = QWidget()
                 act_lay = QHBoxLayout(act_box)
                 act_lay.setContentsMargins(0, 0, 0, 0)
@@ -1809,13 +1906,13 @@ class MainWindow(QMainWindow):
 
                 act_lay.addWidget(open_btn)
                 act_lay.addWidget(copy_btn)
-                self.net_table.setCellWidget(row, 3, act_box)
+                self.net_table.setCellWidget(row, 4, act_box)
 
             else:
                 if fid in self.active_downloads:
                     status_lbl = QLabel("Pobieranie...")
                     status_lbl.setStyleSheet("color: #10b981; font-weight: bold;")
-                    self.net_table.setCellWidget(row, 3, status_lbl)
+                    self.net_table.setCellWidget(row, 4, status_lbl)
                 else:
                     dl_btn = QPushButton("⬇ Pobierz")
                     dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1832,7 +1929,49 @@ class MainWindow(QMainWindow):
                         QPushButton:hover { background-color: #e4e4e7; }
                     """)
                     dl_btn.clicked.connect(lambda _, item=item: self.start_download(item))
-                    self.net_table.setCellWidget(row, 3, dl_btn)
+                    self.net_table.setCellWidget(row, 4, dl_btn)
+
+    def toggle_select_all(self):
+        file_cbs = [cb for cb, item in self.row_checkboxes if item["file"].get("type") != "link"]
+        if not file_cbs:
+            self.status_lbl.setText("Brak plików do zaznaczenia w sieci.")
+            return
+
+        all_checked = all(cb.isChecked() for cb in file_cbs)
+        new_state = not all_checked
+        for cb in file_cbs:
+            cb.setChecked(new_state)
+
+        if new_state:
+            self.select_all_btn.setText("☐ Odznacz wszystko")
+            self.status_lbl.setText(f"Zaznaczono wszystkie pliki ({len(file_cbs)}). Kliknij 'Pobierz zaznaczone'.")
+        else:
+            self.select_all_btn.setText("☑ Zaznacz wszystko")
+            self.status_lbl.setText("Odznaczono wszystkie pliki.")
+
+    def download_selected(self):
+        selected_items = [item for cb, item in self.row_checkboxes if cb.isChecked() and item["file"].get("type") != "link"]
+        if not selected_items:
+            QMessageBox.information(self, "Pobieranie", "Zaznacz pliki, które chcesz pobrać, lub kliknij 'Pobierz wszystkie'.")
+            return
+        self.download_batch(selected_items)
+
+    def download_all(self):
+        all_files = [item for _, item in self.row_checkboxes if item["file"].get("type") != "link"]
+        if not all_files:
+            QMessageBox.information(self, "Pobieranie", "Brak plików w sieci do pobrania.")
+            return
+        self.download_batch(all_files)
+
+    def download_batch(self, items):
+        count = len(items)
+        started = 0
+        for it in items:
+            fid = it["file"]["id"]
+            if fid not in self.active_downloads:
+                self.start_download(it)
+                started += 1
+        self.status_lbl.setText(f"Rozpoczęto pobieranie {started} z {count} plików do folderu Downloads/LanDrop (bez pakowania).")
 
     def open_link(self, url):
         target = url

@@ -616,13 +616,35 @@ class MainActivity : ComponentActivity() {
                 .fillMaxSize()
                 .padding(16.dp)
         ) {
-            Text(
-                "ELEMENTY WYSTAWIONE PRZEZ KOMPUTERY",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 1.sp,
-                color = TextMuted
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    "ELEMENTY W SIECI",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    color = TextMuted
+                )
+
+                val downloadableFiles = allRemoteFiles.filter { it.type != "link" }
+                if (downloadableFiles.isNotEmpty()) {
+                    Button(
+                        onClick = {
+                            for (file in downloadableFiles) {
+                                onDownloadFile(file)
+                            }
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text("Pobierz wszystkie (${downloadableFiles.size})", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    }
+                }
+            }
 
             Spacer(Modifier.height(10.dp))
 
