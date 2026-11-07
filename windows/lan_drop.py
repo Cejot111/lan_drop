@@ -25,7 +25,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse, parse_qs
 
 import qrcode
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QEvent
 from PyQt6.QtGui import QIcon, QFont, QColor, QPalette, QDragEnterEvent, QDropEvent, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1149,7 +1149,7 @@ class DropZoneWidget(QFrame):
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setStyleSheet("font-size: 14px; font-weight: 800; letter-spacing: 0.5px; color: #ffffff; background: transparent;")
 
-        self.sub_label = QLabel("Pliki natychmiast pojawią się w puli telefonu")
+        self.sub_label = QLabel("Możesz upuścić pliki w dowolnym miejscu okna")
         self.sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sub_label.setStyleSheet("font-size: 12px; color: #71717a; background: transparent;")
 
@@ -1233,8 +1233,10 @@ class MainWindow(QMainWindow):
         self.discovery.peers_updated.connect(self.on_peers_updated)
         self.discovery.start()
 
+        self.setAcceptDrops(True)
         self.setup_ui()
         self.apply_theme()
+        QApplication.instance().installEventFilter(self)
 
     def setup_ui(self):
         central = QWidget()
@@ -2070,6 +2072,68 @@ class MainWindow(QMainWindow):
                 subprocess.Popen(["xdg-open", str(dl_dir)])
         except Exception:
             QMessageBox.information(self, "Pobrane", f"Folder pobranych:\n{dl_dir}")
+
+    # =================================================================
+    # OBSŁUGA PRZECIĄGNIJ I UPUŚĆ W CAŁYM OKNIE (DRAG & DROP)
+    # =================================================================
+
+    def eventFilter(self, watched, event):
+        etype = event.type()
+        if etype in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            if hasattr(event, "mimeData") and event.mimeData().hasUrls():
+                event.acceptProposedAction()
+                if hasattr(self, "drop_zone"):
+                    self.drop_zone.set_hover_style()
+                self.status_lbl.setText("Upuść pliki w oknie, aby dodać je do puli...")
+                return True
+        elif etype == QEvent.Type.DragLeave:
+            if hasattr(self, "drop_zone"):
+                self.drop_zone.set_idle_style()
+            self.status_lbl.setText("Gotowy. Przeciągnij pliki w dowolne miejsce okna lub kliknij 'Dodaj link'.")
+        elif etype == QEvent.Type.Drop:
+            if hasattr(event, "mimeData") and event.mimeData().hasUrls():
+                if hasattr(self, "drop_zone"):
+                    self.drop_zone.set_idle_style()
+                event.acceptProposedAction()
+                self._handle_dropped_urls(event.mimeData().urls())
+                return True
+        return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            if hasattr(self, "drop_zone"):
+                self.drop_zone.set_hover_style()
+            self.status_lbl.setText("Upuść pliki w oknie, aby dodać je do puli...")
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        if hasattr(self, "drop_zone"):
+            self.drop_zone.set_idle_style()
+        self.status_lbl.setText("Gotowy. Przeciągnij pliki w dowolne miejsce okna lub kliknij 'Dodaj link'.")
+
+    def dropEvent(self, event: QDropEvent):
+        if hasattr(self, "drop_zone"):
+            self.drop_zone.set_idle_style()
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._handle_dropped_urls(event.mimeData().urls())
+
+    def _handle_dropped_urls(self, urls):
+        paths = []
+        for u in urls:
+            lp = u.toLocalFile()
+            if os.path.isfile(lp):
+                paths.append(lp)
+            elif os.path.isdir(lp):
+                for root, _, files in os.walk(lp):
+                    for f in files:
+                        paths.append(os.path.join(root, f))
+        if paths:
+            self.add_files_to_pool(paths)
 
     def closeEvent(self, event):
         self.status_lbl.setText("Zamykanie...")
