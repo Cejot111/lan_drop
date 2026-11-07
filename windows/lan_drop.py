@@ -1321,6 +1321,25 @@ class MainWindow(QMainWindow):
         dl_btn.clicked.connect(self.open_downloads_folder)
         actions.addWidget(dl_btn)
 
+        # Przycisk: Zamknij (wyłącza hotspot i zamyka program)
+        close_app_btn = QPushButton("✕")
+        close_app_btn.setToolTip("Zamknij program (wyłącza hotspot Wi-Fi i zamyka)")
+        close_app_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_app_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #71717a;
+                border: 1px solid #27272a;
+                padding: 8px 12px;
+                border-radius: 8px;
+                font-weight: 700;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #27272a; color: #ef4444; border-color: #ef4444; }
+        """)
+        close_app_btn.clicked.connect(self.close)
+        actions.addWidget(close_app_btn)
+
         h_layout.addLayout(actions)
         main_layout.addWidget(header)
 
@@ -2135,20 +2154,84 @@ class MainWindow(QMainWindow):
         if paths:
             self.add_files_to_pool(paths)
 
+    def stop_hotspot_sync(self):
+        """Synchroniczne wyłączenie punktu dostępu Wi-Fi przed zamknięciem programu."""
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hotspot_helper.ps1")
+        if not os.path.exists(script_path):
+            return
+        try:
+            cmd = [
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-File", script_path, "-Action", "stop"
+            ]
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.run(cmd, capture_output=True, text=True, timeout=12, creationflags=flags)
+        except Exception:
+            pass
+
     def closeEvent(self, event):
         self.status_lbl.setText("Zamykanie...")
-        if self.hotspot_started_by_us:
-            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hotspot_helper.ps1")
-            try:
-                subprocess.Popen([
-                    "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", script_path, "-Action", "stop"
-                ], creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-            except Exception:
-                pass
 
+        # 1. Sprawdź, czy hotspot był włączony - jeśli tak, wyłącz go NAJPIERW
+        if self.hotspot_active or self.hotspot_started_by_us:
+            self.status_lbl.setText("Wyłączanie punktu dostępu Wi-Fi...")
+            QApplication.processEvents()
+
+            # Pokaż czytelne okno informujące o wyłączaniu hotspotu
+            dlg = QDialog(self)
+            dlg.setWindowTitle("LAN Drop")
+            dlg.setFixedSize(360, 150)
+            dlg.setStyleSheet("background-color: #09090b; color: #ffffff; border: 1px solid #27272a; border-radius: 12px;")
+            dlg.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowTitleHint)
+
+            d_lay = QVBoxLayout(dlg)
+            d_lay.setContentsMargins(20, 20, 20, 20)
+            d_lay.setSpacing(10)
+            d_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            msg = QLabel("Wyłączanie punktu dostępu Wi-Fi...")
+            msg.setStyleSheet("font-size: 14px; font-weight: 700; color: #ffffff;")
+            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            sub = QLabel("Proszę czekać, router jest bezpiecznie zatrzymywany.")
+            sub.setStyleSheet("font-size: 12px; color: #a1a1aa;")
+            sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            pbar = QProgressBar()
+            pbar.setRange(0, 0)
+            pbar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #27272a;
+                    border-radius: 4px;
+                    background-color: #121214;
+                    height: 10px;
+                }
+                QProgressBar::chunk {
+                    background-color: #10b981;
+                    border-radius: 3px;
+                }
+            """)
+
+            d_lay.addWidget(msg)
+            d_lay.addWidget(sub)
+            d_lay.addWidget(pbar)
+
+            dlg.show()
+            QApplication.processEvents()
+
+            # Bezpieczne wyłączenie hotspotu w systemie Windows
+            self.stop_hotspot_sync()
+            self.hotspot_active = False
+            self.hotspot_started_by_us = False
+
+            dlg.accept()
+
+        # 2. Zatrzymaj rozgłaszanie UDP i wyślij sygnał odejścia (farewell)
         self.discovery.stop()
+
+        # 3. Zatrzymaj lokalny serwer HTTP
         self.server.stop()
+
         event.accept()
 
 
@@ -2156,11 +2239,26 @@ class MainWindow(QMainWindow):
 # START
 # =====================================================================
 
+def set_dark_titlebar(window):
+    """Włącza systemowy Pure Black pasek tytułowy w Windows 10/11."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        hwnd = int(window.winId())
+        val = ctypes.c_int(1)
+        res = ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(val), ctypes.sizeof(val))
+        if res != 0:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 19, ctypes.byref(val), ctypes.sizeof(val))
+    except Exception:
+        pass
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = MainWindow()
     win.show()
+    set_dark_titlebar(win)
     sys.exit(app.exec())
 
 if __name__ == "__main__":
