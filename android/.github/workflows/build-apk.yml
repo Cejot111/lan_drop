@@ -1,0 +1,51 @@
+name: Build Android APK (LAN Drop Pool)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle 8.4
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.4'
+
+      - name: Build APK (Release & Debug)
+        run: |
+          if [ -d "android" ]; then
+            echo "Wykryto podkatalog android - przejscie do niego..."
+            cd android
+          fi
+          gradle assembleRelease --stacktrace
+
+      - name: Znajdz wygenerowany plik APK
+        id: find_apk
+        run: |
+          APK_PATH=$(find . -name "*.apk" -not -path "*/intermediates/*" | head -n 1)
+          echo "Znaleziony APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> $GITHUB_OUTPUT
+
+      - name: Udostepnij APK jako Artifact w GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: LanDropPool-Android-APK
+          path: ${{ steps.find_apk.outputs.apk_path }}
+          if-no-files-found: error
+          retention-days: 30
