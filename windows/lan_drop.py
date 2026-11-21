@@ -658,8 +658,14 @@ class ProgressStream(io.RawIOBase):
 
 
 class HttpFileHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, format, *args):
         pass
+
+    def end_headers(self):
+        self.send_header("Connection", "close")
+        super().end_headers()
 
     def do_GET(self):
         pool = self.server.pool_manager
@@ -945,7 +951,7 @@ class LocalServer:
         self.on_link_received = None
 
     def start(self):
-        ThreadingHTTPServer.allow_reuse_address = True
+        ThreadingHTTPServer.allow_reuse_address = False
 
         # Zwalnianie ewentualnego zawieszonego procesu python na porcie 50505
         try:
@@ -1173,6 +1179,7 @@ class LanDiscovery(QThread):
         try:
             req = urllib.request.Request(f"http://{ip}:{port}/api/pool?t={int(time.time()*1000)}")
             req.add_header("Cache-Control", "no-cache")
+            req.add_header("Connection", "close")
             with urllib.request.urlopen(req, timeout=2.5) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
                 pid = data.get("deviceId", ip)
@@ -1271,6 +1278,7 @@ class DownloadWorker(QThread):
                 try:
                     req = urllib.request.Request(url)
                     req.add_header("Cache-Control", "no-cache")
+                    req.add_header("Connection", "close")
                     req.add_header("Accept", "application/x-tar, application/zip, */*")
                     r = urllib.request.urlopen(req, timeout=30)
                     if r.status == 200:
@@ -1353,6 +1361,8 @@ class DownloadWorker(QThread):
         try:
             req = urllib.request.Request(url)
             req.add_header("Cache-Control", "no-cache")
+            req.add_header("Connection", "close")
+            req.add_header("Connection", "close")
             resp = urllib.request.urlopen(req, timeout=30)
             try:
                 if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "_sock"):
@@ -1434,6 +1444,7 @@ class UpdateWorker(QThread):
         try:
             req = urllib.request.Request(url)
             req.add_header("Cache-Control", "no-cache")
+            req.add_header("Connection", "close")
             with urllib.request.urlopen(req, timeout=30) as resp, open(zip_path, "wb") as out_file:
                 total_bytes = int(resp.headers.get("Content-Length", self.file_size))
                 downloaded = 0
@@ -2374,59 +2385,67 @@ class MainWindow(QMainWindow):
         threading.Thread(target=self._fetch_manual_ip_worker, args=(target_ip, target_port), daemon=True).start()
 
     def _fetch_manual_ip_worker(self, ip, port):
-        try:
-            req = urllib.request.Request(f"http://{ip}:{port}/api/pool?t={int(time.time()*1000)}")
-            req.add_header("Cache-Control", "no-cache")
-            with urllib.request.urlopen(req, timeout=3.5) as resp:
-                data = json.loads(resp.read().decode('utf-8'))
-                pid = data.get("deviceId", ip)
-                if pid == self.device_id:
-                    QTimer.singleShot(0, lambda: self.status_lbl.setText("Podano adres IP tego samego komputera."))
+        last_err = None
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(f"http://{ip}:{port}/api/pool?t={int(time.time()*1000)}")
+                req.add_header("Cache-Control", "no-cache")
+                req.add_header("Connection", "close")
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                    pid = data.get("deviceId", ip)
+                    if pid == self.device_id:
+                        QTimer.singleShot(0, lambda: self.status_lbl.setText("Podano adres IP tego samego komputera."))
+                        return
+
+                    parsed_files = []
+                    for f in data.get("files", []):
+                        f_item = {
+                            "id": f.get("id"),
+                            "name": f.get("name"),
+                            "size": f.get("size", 0),
+                            "type": f.get("type", "file"),
+                            "content": f.get("content"),
+                            "file_count": f.get("file_count", 1)
+                        }
+                        if "version" in f:
+                            f_item["version"] = f["version"]
+                        parsed_files.append(f_item)
+
+                    with self.discovery.lock:
+                        self.discovery.peers[pid] = {
+                            "last_seen": time.time(),
+                            "ip": ip,
+                            "deviceName": data.get("deviceName", f"Komputer ({ip})"),
+                            "platform": "manual_ip",
+                            "port": port,
+                            "version": data.get("version", 1),
+                            "app_version": data.get("app_version"),
+                            "files": parsed_files
+                        }
+                        self.discovery.peers_updated.emit(dict(self.discovery.peers))
+
+                    dev_name = data.get("deviceName", ip)
+                    file_cnt = len(parsed_files)
+                    QTimer.singleShot(0, lambda: self.status_lbl.setText(f"✓ Połączono z {dev_name} ({ip}:{port})! Pula: {file_cnt} elementów."))
+                    self.discovery._send_beacon("beacon", target_ip=ip)
                     return
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5)
 
-                parsed_files = []
-                for f in data.get("files", []):
-                    f_item = {
-                        "id": f.get("id"),
-                        "name": f.get("name"),
-                        "size": f.get("size", 0),
-                        "type": f.get("type", "file"),
-                        "content": f.get("content"),
-                        "file_count": f.get("file_count", 1)
-                    }
-                    if "version" in f:
-                        f_item["version"] = f["version"]
-                    parsed_files.append(f_item)
+        err_str = str(last_err)
+        if "10054" in err_str:
+            diag = "Połączenie zostało gwałtownie przerwane (WinError 10054).\n\nPrawdopodobna przyczyna:\n1. Program na drugim komputerze zrestartował się lub został zamknięty.\n2. Zapora sieciowa / program antywirusowy zablokował połączenie.\n3. Upewnij się, że na drugim komputerze program jest otwarty i spróbuj ponownie."
+        else:
+            diag = f"Szczegóły: {err_str}\n\nUpewnij się, że:\n1. Oba komputery są w tej samej sieci Wi-Fi.\n2. Program LAN Drop jest uruchomiony na drugim komputerze.\n3. Zapora Windows nie blokuje portu 50505."
 
-                with self.discovery.lock:
-                    self.discovery.peers[pid] = {
-                        "last_seen": time.time(),
-                        "ip": ip,
-                        "deviceName": data.get("deviceName", f"Komputer ({ip})"),
-                        "platform": "manual_ip",
-                        "port": port,
-                        "version": data.get("version", 1),
-                        "app_version": data.get("app_version"),
-                        "files": parsed_files
-                    }
-                    self.discovery.peers_updated.emit(dict(self.discovery.peers))
-
-                dev_name = data.get("deviceName", ip)
-                file_cnt = len(parsed_files)
-                QTimer.singleShot(0, lambda: self.status_lbl.setText(f"✓ Połączono z {dev_name} ({ip}:{port})! Pula: {file_cnt} elementów."))
-                self.discovery._send_beacon("beacon", target_ip=ip)
-        except Exception as e:
-            QTimer.singleShot(0, lambda: self.status_lbl.setText(f"Nie udało się połączyć z {ip}:{port}: {e}"))
-            QTimer.singleShot(0, lambda: QMessageBox.warning(
-                self,
-                "Błąd połączenia",
-                f"Nie udało się połączyć z adresem {ip}:{port}.\n\n"
-                f"Szczegóły: {e}\n\n"
-                "Upewnij się, że:\n"
-                "1. Oba komputery są połączone z tą samą siecią Wi-Fi.\n"
-                "2. Program LAN Drop jest uruchomiony na drugim komputerze.\n"
-                "3. Zapora Windows nie blokuje portu 50505."
-            ))
+        QTimer.singleShot(0, lambda: self.status_lbl.setText(f"Nie udało się połączyć z {ip}:{port}."))
+        QTimer.singleShot(0, lambda: QMessageBox.warning(
+            self,
+            "Błąd połączenia",
+            f"Nie udało się połączyć z adresem {ip}:{port}.\n\n{diag}"
+        ))
 
     # =================================================================
     # OBSŁUGA TWOJEJ PULI (PLIKI I LINKI)

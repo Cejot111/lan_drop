@@ -18,6 +18,7 @@ if not exist "%TARGET_DIR%\windows" (
 
 echo Zamykanie dzialajacego programu LAN Drop...
 taskkill /f /im pythonw.exe >nul 2>&1
+taskkill /f /im python.exe >nul 2>&1
 timeout /t 2 /nobreak >nul
 
 echo Kopiowanie nowej wersji do: %TARGET_DIR% ...
