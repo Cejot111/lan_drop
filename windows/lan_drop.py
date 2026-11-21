@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
 BROADCAST_PORT = 45454
 DEFAULT_HTTP_PORT = 50505
 APP_NAME = "LAN DROP"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 def parse_version(v_str):
     try:
@@ -61,27 +61,44 @@ def format_size(bytes_num):
         bytes_num /= 1024.0
     return f"{bytes_num:.1f} PB"
 
+def is_valid_local_ip(ip):
+    if not ip or not isinstance(ip, str):
+        return False
+    # Odrzucamy loopback, APIPA, oraz wirtualne adaptery VirtualBox (192.168.56.x)
+    if ip.startswith('127.') or ip.startswith('169.254.') or ip.startswith('192.168.56.') or ip.startswith('0.'):
+        return False
+    return True
+
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(('1.1.1.1', 80))
-        ip = s.getsockname()[0]
+        cand = s.getsockname()[0]
+        if is_valid_local_ip(cand):
+            return cand
     except Exception:
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-        except Exception:
-            ip = '127.0.0.1'
+        pass
     finally:
         s.close()
-    return ip
+
+    try:
+        host_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+        for ip in host_ips:
+            if is_valid_local_ip(ip):
+                return ip
+    except Exception:
+        pass
+    return '127.0.0.1'
 
 def get_all_local_ips():
-    """Zwraca wszystkie aktywne adresy IPv4 z kart sieciowych (Wi-Fi, Hotspot, Ethernet)."""
+    """Zwraca wszystkie aktywne adresy IPv4 z kart sieciowych (Wi-Fi, Hotspot, Ethernet), pomijając wirtualne (VirtualBox)."""
     ips = set()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('1.1.1.1', 80))
-        ips.add(s.getsockname()[0])
+        cand = s.getsockname()[0]
+        if is_valid_local_ip(cand):
+            ips.add(cand)
         s.close()
     except Exception:
         pass
@@ -89,7 +106,7 @@ def get_all_local_ips():
     try:
         host_ips = socket.gethostbyname_ex(socket.gethostname())[2]
         for ip in host_ips:
-            if not ip.startswith('127.'):
+            if is_valid_local_ip(ip):
                 ips.add(ip)
     except Exception:
         pass
@@ -928,7 +945,24 @@ class LocalServer:
         self.on_link_received = None
 
     def start(self):
-        for p in range(self.port, self.port + 50):
+        ThreadingHTTPServer.allow_reuse_address = True
+
+        # Zwalnianie ewentualnego zawieszonego procesu python na porcie 50505
+        try:
+            cur_pid = os.getpid()
+            out = subprocess.check_output(f'netstat -ano | findstr :{self.port}', shell=True).decode('utf-8', errors='ignore')
+            for line in out.splitlines():
+                if "LISTENING" in line.upper():
+                    parts = line.strip().split()
+                    if parts:
+                        owner_pid = int(parts[-1])
+                        if owner_pid != cur_pid and owner_pid > 0:
+                            subprocess.call(f'taskkill /f /pid {owner_pid}', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            time.sleep(0.5)
+        except Exception:
+            pass
+
+        for p in [self.port] + list(range(self.port + 1, self.port + 10)):
             try:
                 self.server = ThreadingHTTPServer(('0.0.0.0', p), HttpFileHandler)
                 self.server.pool_manager = self.pool
@@ -1735,13 +1769,47 @@ class MainWindow(QMainWindow):
         title_box.addWidget(app_title)
         title_box.addWidget(self.ver_badge)
 
-        self.ip_badge = QLabel(f"{self.local_ip}:{self.server.port}")
-        self.ip_badge.setStyleSheet("background-color: #18181b; color: #a1a1aa; border: 1px solid #27272a; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 12px;")
+        self.ip_badge = QPushButton(f"🌐 {self.local_ip}:{self.server.port}")
+        self.ip_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ip_badge.setToolTip(f"Kliknij, aby skopiować link do przeglądarki (http://{self.local_ip}:{self.server.port})")
+        self.ip_badge.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #10b981;
+                border: 1px solid #27272a;
+                padding: 4px 10px;
+                border-radius: 6px;
+                font-family: monospace;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background-color: #27272a; border-color: #10b981; }
+        """)
+        self.ip_badge.clicked.connect(self.copy_web_url)
         title_box.addWidget(self.ip_badge)
 
         self.peers_badge = QLabel("Urządzenia: 0")
         self.peers_badge.setStyleSheet("background-color: #18181b; color: #71717a; border: 1px solid #27272a; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;")
         title_box.addWidget(self.peers_badge)
+
+        # Przycisk ręcznego łączenia z IP (gdy router blokuje UDP broadcast)
+        self.connect_ip_btn = QPushButton("➕ Połącz z IP")
+        self.connect_ip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.connect_ip_btn.setToolTip("Wpisz adres IP drugiego komputera lub telefonu (np. 192.168.1.11)")
+        self.connect_ip_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #ffffff;
+                border: 1px solid #3f3f46;
+                padding: 4px 10px;
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background-color: #27272a; border-color: #10b981; color: #10b981; }
+        """)
+        self.connect_ip_btn.clicked.connect(self.prompt_connect_ip)
+        title_box.addWidget(self.connect_ip_btn)
 
         h_layout.addLayout(title_box)
         h_layout.addStretch()
@@ -2267,6 +2335,98 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, lambda: self.refresh_my_pool_ui())
             QTimer.singleShot(0, lambda: self.status_lbl.setText(f"Otrzymano link z telefonu: {link_url}"))
             self.discovery._send_beacon("beacon")
+
+    def copy_web_url(self):
+        url = f"http://{self.local_ip}:{self.server.port}"
+        QApplication.clipboard().setText(url)
+        self.status_lbl.setText(f"✓ Skopiowano link WWW do schowka: {url}")
+
+    def prompt_connect_ip(self):
+        ip, ok = QInputDialog.getText(
+            self,
+            "Ręczne łączenie z IP",
+            "Wpisz adres IP drugiego komputera w Twojej sieci Wi-Fi:\n(np. 192.168.1.11 lub 192.168.1.11:50505)",
+            QLineEdit.EchoMode.Normal,
+            ""
+        )
+        if ok and ip.strip():
+            self.connect_to_peer_ip(ip.strip())
+
+    def connect_to_peer_ip(self, target_raw):
+        target = target_raw.replace("http://", "").replace("https://", "").strip()
+        if ":" in target:
+            parts = target.split(":")
+            target_ip = parts[0].strip()
+            try:
+                target_port = int(parts[1].strip().split("/")[0])
+            except Exception:
+                target_port = DEFAULT_HTTP_PORT
+        else:
+            target_ip = target.split("/")[0].strip()
+            target_port = DEFAULT_HTTP_PORT
+
+        self.status_lbl.setText(f"Łączenie z {target_ip}:{target_port}...")
+        QApplication.processEvents()
+
+        self.discovery.known_peer_ips.add(target_ip)
+        self.discovery._send_beacon("beacon", target_ip=target_ip)
+
+        threading.Thread(target=self._fetch_manual_ip_worker, args=(target_ip, target_port), daemon=True).start()
+
+    def _fetch_manual_ip_worker(self, ip, port):
+        try:
+            req = urllib.request.Request(f"http://{ip}:{port}/api/pool?t={int(time.time()*1000)}")
+            req.add_header("Cache-Control", "no-cache")
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                pid = data.get("deviceId", ip)
+                if pid == self.device_id:
+                    QTimer.singleShot(0, lambda: self.status_lbl.setText("Podano adres IP tego samego komputera."))
+                    return
+
+                parsed_files = []
+                for f in data.get("files", []):
+                    f_item = {
+                        "id": f.get("id"),
+                        "name": f.get("name"),
+                        "size": f.get("size", 0),
+                        "type": f.get("type", "file"),
+                        "content": f.get("content"),
+                        "file_count": f.get("file_count", 1)
+                    }
+                    if "version" in f:
+                        f_item["version"] = f["version"]
+                    parsed_files.append(f_item)
+
+                with self.discovery.lock:
+                    self.discovery.peers[pid] = {
+                        "last_seen": time.time(),
+                        "ip": ip,
+                        "deviceName": data.get("deviceName", f"Komputer ({ip})"),
+                        "platform": "manual_ip",
+                        "port": port,
+                        "version": data.get("version", 1),
+                        "app_version": data.get("app_version"),
+                        "files": parsed_files
+                    }
+                    self.discovery.peers_updated.emit(dict(self.discovery.peers))
+
+                dev_name = data.get("deviceName", ip)
+                file_cnt = len(parsed_files)
+                QTimer.singleShot(0, lambda: self.status_lbl.setText(f"✓ Połączono z {dev_name} ({ip}:{port})! Pula: {file_cnt} elementów."))
+                self.discovery._send_beacon("beacon", target_ip=ip)
+        except Exception as e:
+            QTimer.singleShot(0, lambda: self.status_lbl.setText(f"Nie udało się połączyć z {ip}:{port}: {e}"))
+            QTimer.singleShot(0, lambda: QMessageBox.warning(
+                self,
+                "Błąd połączenia",
+                f"Nie udało się połączyć z adresem {ip}:{port}.\n\n"
+                f"Szczegóły: {e}\n\n"
+                "Upewnij się, że:\n"
+                "1. Oba komputery są połączone z tą samą siecią Wi-Fi.\n"
+                "2. Program LAN Drop jest uruchomiony na drugim komputerze.\n"
+                "3. Zapora Windows nie blokuje portu 50505."
+            ))
 
     # =================================================================
     # OBSŁUGA TWOJEJ PULI (PLIKI I LINKI)

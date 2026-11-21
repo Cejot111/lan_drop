@@ -18,6 +18,9 @@ echo Sprawdzanie i instalowanie wymaganych bibliotek...
 pip install -r requirements.txt
 
 echo.
+echo Zamykanie ewentualnych starych procesow w tle...
+taskkill /f /im pythonw.exe >nul 2>&1
+
 echo Uruchamianie aplikacji...
 start pythonw lan_drop.py
 if %errorlevel% neq 0 (
