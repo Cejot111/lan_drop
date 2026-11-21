@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
 BROADCAST_PORT = 45454
 DEFAULT_HTTP_PORT = 50505
 APP_NAME = "LAN DROP"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 
 def parse_version(v_str):
     try:
@@ -991,6 +991,7 @@ class LanDiscovery(QThread):
             "platform": "windows",
             "port": self.http_port,
             "version": self.pool.version,
+            "app_version": APP_VERSION,
             "files": self.pool.get_list()
         }
         data = json.dumps(payload).encode('utf-8')
@@ -1090,13 +1091,17 @@ class LanDiscovery(QThread):
                     else:
                         parsed_files = []
                         for f in msg.get("files", []):
-                            parsed_files.append({
+                            f_item = {
                                 "id": f.get("id"),
                                 "name": f.get("name"),
                                 "size": f.get("size", 0),
                                 "type": f.get("type", "file"),
-                                "content": f.get("content")
-                            })
+                                "content": f.get("content"),
+                                "file_count": f.get("file_count", 1)
+                            }
+                            if "version" in f:
+                                f_item["version"] = f["version"]
+                            parsed_files.append(f_item)
 
                         self.peers[peer_id] = {
                             "last_seen": time.time(),
@@ -1105,6 +1110,7 @@ class LanDiscovery(QThread):
                             "platform": msg.get("platform", "unknown"),
                             "port": msg.get("port", DEFAULT_HTTP_PORT),
                             "version": msg.get("version", 1),
+                            "app_version": msg.get("app_version"),
                             "files": parsed_files
                         }
                         self.peers_updated.emit(dict(self.peers))
@@ -1141,13 +1147,17 @@ class LanDiscovery(QThread):
 
                 parsed_files = []
                 for f in data.get("files", []):
-                    parsed_files.append({
+                    f_item = {
                         "id": f.get("id"),
                         "name": f.get("name"),
                         "size": f.get("size", 0),
                         "type": f.get("type", "file"),
-                        "content": f.get("content")
-                    })
+                        "content": f.get("content"),
+                        "file_count": f.get("file_count", 1)
+                    }
+                    if "version" in f:
+                        f_item["version"] = f["version"]
+                    parsed_files.append(f_item)
 
                 with self.lock:
                     self.peers[pid] = {
@@ -1157,6 +1167,7 @@ class LanDiscovery(QThread):
                         "platform": "http_sync",
                         "port": port,
                         "version": data.get("version", 1),
+                        "app_version": data.get("app_version"),
                         "files": parsed_files
                     }
                     self.peers_updated.emit(dict(self.peers))
@@ -1356,12 +1367,29 @@ class UpdateWorker(QThread):
     finished = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, file_id, file_size, host_ip, host_port):
+    def __init__(self, file_id, file_size, host_ip, host_port, target_dir=None, python_exe=None):
         super().__init__()
         self.file_id = file_id
         self.file_size = file_size
         self.host_ip = host_ip
         self.host_port = host_port
+
+        if target_dir:
+            self.target_dir = os.path.abspath(target_dir).rstrip("\\/")
+        else:
+            cur_script = os.path.abspath(__file__)
+            win_dir = os.path.dirname(cur_script)
+            if os.path.basename(win_dir).lower() == "windows":
+                self.target_dir = os.path.abspath(os.path.dirname(win_dir)).rstrip("\\/")
+            else:
+                self.target_dir = os.path.abspath(win_dir).rstrip("\\/")
+
+        if python_exe:
+            self.python_exe = os.path.abspath(python_exe)
+        else:
+            py_dir = os.path.dirname(sys.executable)
+            pw = os.path.join(py_dir, "pythonw.exe")
+            self.python_exe = os.path.abspath(pw if os.path.exists(pw) else sys.executable)
 
     def run(self):
         url = f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}"
@@ -1372,7 +1400,7 @@ class UpdateWorker(QThread):
         try:
             req = urllib.request.Request(url)
             req.add_header("Cache-Control", "no-cache")
-            with urllib.request.urlopen(req, timeout=15) as resp, open(zip_path, "wb") as out_file:
+            with urllib.request.urlopen(req, timeout=30) as resp, open(zip_path, "wb") as out_file:
                 total_bytes = int(resp.headers.get("Content-Length", self.file_size))
                 downloaded = 0
                 chunk_size = 512 * 1024
@@ -1408,7 +1436,10 @@ class UpdateWorker(QThread):
             except Exception:
                 pass
 
-            target_dir = r"C:\Lan drop pool"
+            clean_extract = os.path.abspath(extract_dir).rstrip("\\/")
+            clean_target = os.path.abspath(self.target_dir).rstrip("\\/")
+            clean_py = os.path.abspath(self.python_exe)
+            clean_win_dir = os.path.join(clean_target, "windows")
             bat_path = os.path.join(temp_dir, "apply_update.bat")
 
             bat_content = f"""@echo off
@@ -1417,16 +1448,23 @@ title Wgrywanie aktualizacji LAN DROP
 echo ========================================================
 echo        WGRYWANIE AKTUALIZACJI LAN DROP POOL
 echo ========================================================
-echo Zamykanie poprzedniej wersji programu...
+echo Zamykanie dzialajacej instancji LAN Drop (PID: %1)...
 taskkill /f /pid %1 >nul 2>&1
-timeout /t 1 /nobreak >nul
+timeout /t 2 /nobreak >nul
 
-echo Podmienianie plikow na nowa wersje...
-xcopy /s /y /q "{extract_dir}\\*" "{target_dir}\\" >nul 2>&1
+echo Kopiowanie nowych plikow do: {clean_target} ...
+robocopy "{clean_extract}" "{clean_target}" /E /R:5 /W:1 /NP /NFL /NDO /NJH /NJS >nul 2>&1
+if %errorlevel% geq 8 (
+    xcopy /s /y /q /i /r /h "{clean_extract}\\*" "{clean_target}\\" >nul 2>&1
+)
 
+echo.
+echo ========================================================
+echo   SUKCES: Aktualizacja zainstalowana pomyslnie!
+echo ========================================================
 echo Uruchamianie zaktualizowanego programu...
-cd /d "{target_dir}\\windows"
-start "" pythonw lan_drop.py
+cd /d "{clean_win_dir}"
+start "" "{clean_py}" lan_drop.py
 
 echo Czyszczenie plikow instalacyjnych...
 timeout /t 2 /nobreak >nul
@@ -2322,9 +2360,11 @@ class MainWindow(QMainWindow):
                     self.status_lbl.setText(f"✓ Program jest w najnowszej wersji (v{APP_VERSION}). Wszystkie komputery są zaktualizowane.")
                     return
 
-        project_root = r"C:\Lan drop pool"
+        cur_script = os.path.abspath(__file__)
+        win_dir = os.path.dirname(cur_script)
+        project_root = os.path.dirname(win_dir) if os.path.basename(win_dir).lower() == "windows" else win_dir
         if not os.path.exists(project_root):
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            project_root = r"C:\Lan drop pool"
 
         update_zip_path = os.path.join(project_root, "landrop_update.zip")
 
@@ -2356,15 +2396,27 @@ class MainWindow(QMainWindow):
             self.status_lbl.setText(f"Błąd tworzenia aktualizacji: {e}")
             QMessageBox.critical(self, "Błąd", f"Nie udało się wystawić aktualizacji:\n{e}")
 
-    def install_update(self, item):
+    def install_update(self, item, force=False):
         f = item["file"]
         dev_name = item.get("deviceName", "drugiego komputera")
-        ver = f.get("version", "nowa")
+        ver = f.get("version")
+        if not ver:
+            m = re.search(r"v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)", f.get("name", ""))
+            ver = m.group(1) if m else APP_VERSION
+
+        cur_script = os.path.abspath(__file__)
+        win_dir = os.path.dirname(cur_script)
+        project_root = os.path.dirname(win_dir) if os.path.basename(win_dir).lower() == "windows" else win_dir
+
+        if force:
+            prompt_msg = f"Posiadasz już wersję v{APP_VERSION}.\n\nCzy chcesz mimo to wgrać paczkę z {dev_name} ponownie, aby naprawić lub odświeżyć pliki programu?"
+        else:
+            prompt_msg = f"Czy chcesz pobrać i zainstalować aktualizację ({ver}) z {dev_name}?\n\nProgram automatycznie podmieni pliki w folderze:\n{project_root}\ni zrestartuje aplikację."
 
         reply = QMessageBox.question(
             self,
             "Wgrać aktualizację?",
-            f"Czy chcesz pobrać i zainstalować aktualizację ({ver}) z {dev_name}?\n\nProgram automatycznie podmieni pliki w C:\\Lan drop pool i zrestartuje aplikację.",
+            prompt_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes
         )
@@ -2375,7 +2427,7 @@ class MainWindow(QMainWindow):
         self.apply_update_btn.setEnabled(False)
         self.apply_update_btn.setText("Pobieranie aktualizacji...")
 
-        worker = UpdateWorker(f["id"], f["size"], item["ip"], item["port"])
+        worker = UpdateWorker(f["id"], f["size"], item["ip"], item["port"], target_dir=project_root)
 
         def on_update_prog(done, total, speed):
             pct = int((done / total) * 100) if total > 0 else 0
@@ -2393,9 +2445,9 @@ class MainWindow(QMainWindow):
             pid = str(os.getpid())
             try:
                 subprocess.Popen(
-                    ["cmd.exe", "/c", bat_path, pid],
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                    close_fds=True
+                    f'cmd.exe /c start "Aktualizacja LAN Drop" "{bat_path}" {pid}',
+                    shell=True,
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
                 )
             except Exception:
                 subprocess.Popen(["cmd.exe", "/c", bat_path, pid])
@@ -2529,7 +2581,10 @@ class MainWindow(QMainWindow):
                     update_item_found = item_data
 
         if update_item_found:
-            upd_ver = update_item_found["file"].get("version", APP_VERSION)
+            upd_ver = update_item_found["file"].get("version")
+            if not upd_ver:
+                m = re.search(r"v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)", update_item_found["file"].get("name", ""))
+                upd_ver = m.group(1) if m else APP_VERSION
             upd_dev = update_item_found["deviceName"]
 
             if parse_version(upd_ver) > parse_version(APP_VERSION):
@@ -2540,7 +2595,7 @@ class MainWindow(QMainWindow):
                     pass
                 self.apply_update_btn.clicked.connect(lambda _, item=update_item_found: self.install_update(item))
                 self.apply_update_btn.setEnabled(True)
-                self.apply_update_btn.setText("⚡ WGRAJ AKTUALIZACJĘ I ZRESTARTUJ")
+                self.apply_update_btn.setText(f"⚡ WGRAJ AKTUALIZACJĘ (v{upd_ver}) I ZRESTARTUJ")
                 self.update_banner.setVisible(True)
             else:
                 self.update_banner.setVisible(False)
@@ -2664,9 +2719,13 @@ class MainWindow(QMainWindow):
                 self.net_table.setCellWidget(row, 4, act_box)
 
             elif is_update:
-                upd_ver = f.get("version", APP_VERSION)
+                upd_ver = f.get("version")
+                if not upd_ver:
+                    m = re.search(r"v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)", f.get("name", ""))
+                    upd_ver = m.group(1) if m else APP_VERSION
+
                 if parse_version(upd_ver) > parse_version(APP_VERSION):
-                    upd_btn = QPushButton("⚡ Wgraj")
+                    upd_btn = QPushButton(f"⚡ Wgraj (v{upd_ver})")
                     upd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                     upd_btn.setStyleSheet("""
                         QPushButton {
@@ -2682,19 +2741,22 @@ class MainWindow(QMainWindow):
                     """)
                     upd_btn.clicked.connect(lambda _, item=item: self.install_update(item))
                 else:
-                    upd_btn = QPushButton(f"✓ Masz v{APP_VERSION}")
-                    upd_btn.setEnabled(False)
+                    upd_btn = QPushButton(f"✓ v{APP_VERSION} (Wgraj ponownie)")
+                    upd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    upd_btn.setToolTip("Posiadasz tę wersję. Kliknij, jeśli chcesz wgrać ponownie / naprawić pliki.")
                     upd_btn.setStyleSheet("""
                         QPushButton {
                             background-color: #18181b;
-                            color: #10b981;
-                            font-weight: 700;
-                            padding: 6px 14px;
+                            color: #a1a1aa;
+                            font-weight: 600;
+                            padding: 6px 12px;
                             border-radius: 6px;
                             border: 1px solid #27272a;
                             font-size: 11px;
                         }
+                        QPushButton:hover { background-color: #27272a; color: #10b981; border-color: #10b981; }
                     """)
+                    upd_btn.clicked.connect(lambda _, item=item: self.install_update(item, force=True))
                 self.net_table.setCellWidget(row, 4, upd_btn)
 
             else:
