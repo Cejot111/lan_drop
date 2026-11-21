@@ -20,6 +20,9 @@ import io
 import urllib.request
 import urllib.error
 import webbrowser
+import zipfile
+import tempfile
+import shutil
 from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse, parse_qs
@@ -37,6 +40,7 @@ from PyQt6.QtWidgets import (
 BROADCAST_PORT = 45454
 DEFAULT_HTTP_PORT = 50505
 APP_NAME = "LAN DROP"
+APP_VERSION = "1.3.0"
 
 def format_size(bytes_num):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -325,6 +329,10 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
           if (f.type === 'link') {
             const url = f.content || f.name;
             html += '<div class="file-item"><div><div class="file-name">🔗 ' + escapeHtml(f.name) + '</div><div class="file-size">Link WWW</div></div><a class="btn-open" href="' + escapeHtml(url) + '" target="_blank" rel="noopener noreferrer">Otwórz ↗</a></div>';
+          } else if (f.type === 'folder') {
+            html += '<div class="file-item"><div><div class="file-name">📁 ' + escapeHtml(f.name) + '</div><div class="file-size">Folder (' + (f.file_count || 0) + ' plików, ' + fmt(f.size) + ')</div></div><a class="btn-dl" href="/api/download/' + f.id + '" download="' + escapeHtml(f.name) + '.zip">Pobierz ZIP</a></div>';
+          } else if (f.type === 'update') {
+            html += '<div class="file-item"><div><div class="file-name">🚀 ' + escapeHtml(f.name) + '</div><div class="file-size">Aktualizacja LAN Drop (' + fmt(f.size) + ')</div></div><a class="btn-dl" href="/api/download/' + f.id + '" download="landrop_update.zip">Pobierz paczkę</a></div>';
           } else {
             html += '<div class="file-item"><div><div class="file-name">📄 ' + escapeHtml(f.name) + '</div><div class="file-size">' + fmt(f.size) + '</div></div><a class="btn-dl" href="/api/download/' + f.id + '" download="' + escapeHtml(f.name) + '">Pobierz</a></div>';
           }
@@ -403,15 +411,44 @@ MOBILE_WEB_HTML = """<!DOCTYPE html>
 # =====================================================================
 
 class SharedItem:
-    def __init__(self, file_path: str = None, link_url: str = None):
+    def __init__(self, file_path: str = None, link_url: str = None, folder_path: str = None, is_update: bool = False, version: str = APP_VERSION):
         self.id = str(uuid.uuid4())
-        if link_url:
+        self.version = version
+        if is_update:
+            self.type = "update"
+            self.path = os.path.abspath(file_path) if file_path else None
+            self.name = f"Aktualizacja LAN Drop (v{version})"
+            self.content = None
+            self.size = os.path.getsize(self.path) if self.path and os.path.exists(self.path) else 0
+            self.mime = "application/zip"
+            self.file_count = 1
+        elif folder_path:
+            self.type = "folder"
+            self.path = os.path.abspath(folder_path)
+            self.name = os.path.basename(self.path)
+            self.content = None
+            total_size = 0
+            file_count = 0
+            try:
+                for root, _, files in os.walk(self.path):
+                    for f in files:
+                        fp = os.path.join(root, f)
+                        if os.path.isfile(fp):
+                            total_size += os.path.getsize(fp)
+                            file_count += 1
+            except Exception:
+                pass
+            self.size = total_size
+            self.file_count = file_count
+            self.mime = "application/x-directory"
+        elif link_url:
             self.type = "link"
             self.path = None
             self.name = link_url.strip()
             self.content = link_url.strip()
             self.size = len(self.name.encode('utf-8'))
             self.mime = "text/x-uri"
+            self.file_count = 0
         else:
             self.type = "file"
             self.path = os.path.abspath(file_path)
@@ -420,6 +457,7 @@ class SharedItem:
             self.size = os.path.getsize(self.path) if os.path.exists(self.path) else 0
             mime, _ = mimetypes.guess_type(self.path)
             self.mime = mime or "application/octet-stream"
+            self.file_count = 1
 
     def to_dict(self):
         d = {
@@ -427,10 +465,13 @@ class SharedItem:
             "name": self.name,
             "size": self.size,
             "mime": self.mime,
-            "type": self.type
+            "type": self.type,
+            "file_count": getattr(self, "file_count", 1)
         }
         if self.content:
             d["content"] = self.content
+        if getattr(self, "version", None):
+            d["version"] = self.version
         return d
 
 class PoolManager:
@@ -452,12 +493,34 @@ class PoolManager:
                 self.version += 1
         return added
 
+    def add_folder(self, folder_path):
+        folder_path = os.path.abspath(folder_path)
+        if not os.path.isdir(folder_path):
+            return None
+        with self.lock:
+            for item in self.files.values():
+                if item.type == "folder" and item.path == folder_path:
+                    return item
+            item = SharedItem(folder_path=folder_path)
+            self.files[item.id] = item
+            self.version += 1
+            return item
+
+    def add_update(self, zip_path, version=APP_VERSION):
+        with self.lock:
+            to_del = [fid for fid, it in self.files.items() if it.type == "update"]
+            for fid in to_del:
+                del self.files[fid]
+            item = SharedItem(file_path=zip_path, is_update=True, version=version)
+            self.files[item.id] = item
+            self.version += 1
+            return item
+
     def add_link(self, url: str):
         url = url.strip()
         if not url:
             return None
         with self.lock:
-            # Nie dodawaj duplikatów tego samego linku
             for item in self.files.values():
                 if item.type == "link" and item.content == url:
                     return item
@@ -554,6 +617,51 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if item.type == "folder":
+                if not os.path.isdir(item.path):
+                    self.send_response(404)
+                    self.end_headers()
+                    self.wfile.write(b"Folder nie istnieje na dysku.")
+                    return
+
+                temp_zip = None
+                try:
+                    temp_fd, temp_zip = tempfile.mkstemp(suffix=".zip", prefix="landrop_folder_")
+                    os.close(temp_fd)
+                    with zipfile.ZipFile(temp_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
+                        base_dir = os.path.abspath(item.path)
+                        for root, dirs, files in os.walk(base_dir):
+                            for file in files:
+                                full_p = os.path.join(root, file)
+                                rel_p = os.path.relpath(full_p, base_dir)
+                                zf.write(full_p, arcname=rel_p)
+
+                    zip_size = os.path.getsize(temp_zip)
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(zip_size))
+                    self.send_header("X-Item-Type", "folder")
+                    safe_name = f"{item.name}.zip".replace('"', '\\"')
+                    self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                    self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.end_headers()
+
+                    with open(temp_zip, "rb") as f:
+                        while chunk := f.read(512 * 1024):
+                            self.wfile.write(chunk)
+                except (ConnectionResetError, BrokenPipeError):
+                    pass
+                except Exception as e:
+                    print(f"[HTTP] Blad strumieniowania folderu: {e}")
+                finally:
+                    if temp_zip and os.path.exists(temp_zip):
+                        try:
+                            os.remove(temp_zip)
+                        except Exception:
+                            pass
                 return
 
             if not os.path.exists(item.path):
@@ -943,17 +1051,77 @@ class DownloadWorker(QThread):
     finished = pyqtSignal(str, str)
     failed = pyqtSignal(str, str)
 
-    def __init__(self, file_id, file_name, file_size, host_ip, host_port):
+    def __init__(self, file_id, file_name, file_size, host_ip, host_port, item_type="file"):
         super().__init__()
         self.file_id = file_id
         self.file_name = file_name
         self.file_size = file_size
         self.host_ip = host_ip
         self.host_port = host_port
+        self.item_type = item_type
         self.dest_dir = get_download_folder()
 
     def run(self):
         url = f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}"
+
+        if self.item_type == "folder":
+            temp_zip = self.dest_dir / f".transfer_{uuid.uuid4().hex[:8]}.tmp"
+            try:
+                req = urllib.request.Request(url)
+                req.add_header("Cache-Control", "no-cache")
+                with urllib.request.urlopen(req, timeout=15) as resp, open(temp_zip, "wb") as out_file:
+                    total_bytes = int(resp.headers.get("Content-Length", self.file_size))
+                    downloaded = 0
+                    chunk_size = 512 * 1024
+                    start_time = time.time()
+                    last_time = start_time
+                    last_bytes = 0
+
+                    while True:
+                        chunk = resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        downloaded += len(chunk)
+
+                        now = time.time()
+                        elapsed = now - last_time
+                        if elapsed >= 0.2:
+                            speed_mbps = ((downloaded - last_bytes) / (1024 * 1024)) / elapsed
+                            last_time = now
+                            last_bytes = downloaded
+                            self.progress.emit(self.file_id, downloaded, total_bytes, speed_mbps)
+
+                    total_elapsed = max(0.001, time.time() - start_time)
+                    avg_speed = (downloaded / (1024 * 1024)) / total_elapsed
+                    self.progress.emit(self.file_id, downloaded, total_bytes, avg_speed)
+
+                target_folder = self.dest_dir / self.file_name
+                counter = 1
+                base_name = self.file_name
+                while target_folder.exists():
+                    target_folder = self.dest_dir / f"{base_name}_{counter}"
+                    counter += 1
+                target_folder.mkdir(parents=True, exist_ok=True)
+
+                with zipfile.ZipFile(temp_zip, 'r') as zf:
+                    zf.extractall(target_folder)
+
+                try:
+                    temp_zip.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+                self.finished.emit(self.file_id, str(target_folder))
+            except Exception as e:
+                try:
+                    if temp_zip.exists():
+                        temp_zip.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self.failed.emit(self.file_id, str(e))
+            return
+
         save_path = self.dest_dir / self.file_name
         counter = 1
         base_stem = save_path.stem
@@ -999,6 +1167,96 @@ class DownloadWorker(QThread):
                 except Exception:
                     pass
             self.failed.emit(self.file_id, str(e))
+
+
+class UpdateWorker(QThread):
+    progress = pyqtSignal(int, int, float)
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, file_id, file_size, host_ip, host_port):
+        super().__init__()
+        self.file_id = file_id
+        self.file_size = file_size
+        self.host_ip = host_ip
+        self.host_port = host_port
+
+    def run(self):
+        url = f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}"
+        temp_dir = tempfile.mkdtemp(prefix="landrop_upd_")
+        zip_path = os.path.join(temp_dir, "update.zip")
+        extract_dir = os.path.join(temp_dir, "extracted")
+
+        try:
+            req = urllib.request.Request(url)
+            req.add_header("Cache-Control", "no-cache")
+            with urllib.request.urlopen(req, timeout=15) as resp, open(zip_path, "wb") as out_file:
+                total_bytes = int(resp.headers.get("Content-Length", self.file_size))
+                downloaded = 0
+                chunk_size = 512 * 1024
+                start_time = time.time()
+                last_time = start_time
+                last_bytes = 0
+
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    downloaded += len(chunk)
+
+                    now = time.time()
+                    elapsed = now - last_time
+                    if elapsed >= 0.2:
+                        speed_mbps = ((downloaded - last_bytes) / (1024 * 1024)) / elapsed
+                        last_time = now
+                        last_bytes = downloaded
+                        self.progress.emit(downloaded, total_bytes, speed_mbps)
+
+                total_elapsed = max(0.001, time.time() - start_time)
+                avg_speed = (downloaded / (1024 * 1024)) / total_elapsed
+                self.progress.emit(downloaded, total_bytes, avg_speed)
+
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(extract_dir)
+
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+
+            target_dir = r"C:\Lan drop pool"
+            bat_path = os.path.join(temp_dir, "apply_update.bat")
+
+            bat_content = f"""@echo off
+chcp 65001 >nul
+title Wgrywanie aktualizacji LAN DROP
+echo ========================================================
+echo        WGRYWANIE AKTUALIZACJI LAN DROP POOL
+echo ========================================================
+echo Zamykanie poprzedniej wersji programu...
+taskkill /f /pid %1 >nul 2>&1
+timeout /t 1 /nobreak >nul
+
+echo Podmienianie plikow na nowa wersje...
+xcopy /s /y /q "{extract_dir}\\*" "{target_dir}\\" >nul 2>&1
+
+echo Uruchamianie zaktualizowanego programu...
+cd /d "{target_dir}\\windows"
+start "" pythonw lan_drop.py
+
+echo Czyszczenie plikow instalacyjnych...
+timeout /t 2 /nobreak >nul
+rd /s /q "{temp_dir}" >nul 2>&1
+exit
+"""
+            with open(bat_path, "w", encoding="utf-8") as bf:
+                bf.write(bat_content)
+
+            self.finished.emit(bat_path)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 # =====================================================================
@@ -1145,11 +1403,11 @@ class DropZoneWidget(QFrame):
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon_label.setStyleSheet("font-size: 34px; background: transparent;")
 
-        self.text_label = QLabel("PRZECIĄGNIJ I UPUSZĆ PLIKI")
+        self.text_label = QLabel("PRZECIĄGNIJ I UPUŚĆ PLIKI LUB FOLDERY")
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setStyleSheet("font-size: 14px; font-weight: 800; letter-spacing: 0.5px; color: #ffffff; background: transparent;")
 
-        self.sub_label = QLabel("Możesz upuścić pliki w dowolnym miejscu okna")
+        self.sub_label = QLabel("Możesz upuścić pliki lub całe foldery w dowolnym miejscu okna")
         self.sub_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.sub_label.setStyleSheet("font-size: 12px; color: #71717a; background: transparent;")
 
@@ -1188,15 +1446,7 @@ class DropZoneWidget(QFrame):
     def dropEvent(self, event: QDropEvent):
         self.set_idle_style()
         urls = event.mimeData().urls()
-        paths = []
-        for u in urls:
-            lp = u.toLocalFile()
-            if os.path.isfile(lp):
-                paths.append(lp)
-            elif os.path.isdir(lp):
-                for root, _, files in os.walk(lp):
-                    for f in files:
-                        paths.append(os.path.join(root, f))
+        paths = [u.toLocalFile() for u in urls if os.path.exists(u.toLocalFile())]
         if paths:
             self.files_dropped.emit(paths)
 
@@ -1303,6 +1553,25 @@ class MainWindow(QMainWindow):
         self.hotspot_btn.clicked.connect(self.toggle_hotspot)
         actions.addWidget(self.hotspot_btn)
 
+        # Przycisk: Wystaw aktualizację
+        self.share_update_btn = QPushButton("🚀 Wystaw aktualizację")
+        self.share_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.share_update_btn.setToolTip("Spakuj i udostępnij program jako aktualizację dla drugiego komputera")
+        self.share_update_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #ffffff;
+                border: 1px solid #3f3f46;
+                padding: 8px 14px;
+                border-radius: 8px;
+                font-weight: 700;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #27272a; border-color: #10b981; color: #10b981; }
+        """)
+        self.share_update_btn.clicked.connect(self.share_update_to_pool)
+        actions.addWidget(self.share_update_btn)
+
         # Przycisk: Otwórz pobrane
         dl_btn = QPushButton("📂 Pobrane")
         dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1343,6 +1612,43 @@ class MainWindow(QMainWindow):
         h_layout.addLayout(actions)
         main_layout.addWidget(header)
 
+        # Baner dostępnej aktualizacji programu w sieci
+        self.update_banner = QFrame()
+        self.update_banner.setStyleSheet("""
+            QFrame {
+                background-color: #064e3b;
+                border: 2px solid #10b981;
+                border-radius: 12px;
+            }
+        """)
+        u_layout = QHBoxLayout(self.update_banner)
+        u_layout.setContentsMargins(18, 12, 18, 12)
+        u_layout.setSpacing(14)
+
+        self.update_banner_lbl = QLabel("⚡ WYKRYTO NOWĄ AKTUALIZACJĘ PROGRAMU W SIECI!")
+        self.update_banner_lbl.setStyleSheet("color: #ffffff; font-weight: 800; font-size: 13px; background: transparent;")
+        u_layout.addWidget(self.update_banner_lbl)
+        u_layout.addStretch()
+
+        self.apply_update_btn = QPushButton("⚡ WGRAJ AKTUALIZACJĘ I ZRESTARTUJ")
+        self.apply_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.apply_update_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #10b981;
+                color: #000000;
+                font-weight: 900;
+                font-size: 13px;
+                padding: 8px 20px;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #34d399; }
+        """)
+        u_layout.addWidget(self.apply_update_btn)
+
+        self.update_banner.setVisible(False)
+        main_layout.addWidget(self.update_banner)
+
         # 2. Główny podział (Splitter)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(10)
@@ -1378,6 +1684,23 @@ class MainWindow(QMainWindow):
         add_files_btn.clicked.connect(self.choose_files)
         left_head.addWidget(add_files_btn)
 
+        add_folder_btn = QPushButton("📁 Dodaj folder")
+        add_folder_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_folder_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #18181b;
+                color: #ffffff;
+                font-weight: 700;
+                font-size: 12px;
+                padding: 6px 14px;
+                border-radius: 6px;
+                border: 1px solid #27272a;
+            }
+            QPushButton:hover { background-color: #27272a; border-color: #3f3f46; }
+        """)
+        add_folder_btn.clicked.connect(self.choose_folder)
+        left_head.addWidget(add_folder_btn)
+
         add_link_btn = QPushButton("🔗 Dodaj link")
         add_link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         add_link_btn.setStyleSheet("""
@@ -1399,7 +1722,7 @@ class MainWindow(QMainWindow):
 
         # Strefa DropZone
         self.drop_zone = DropZoneWidget()
-        self.drop_zone.files_dropped.connect(self.add_files_to_pool)
+        self.drop_zone.files_dropped.connect(self.add_paths_to_pool)
         left_layout.addWidget(self.drop_zone)
 
         # Tabela plików Twojej puli
@@ -1731,6 +2054,11 @@ class MainWindow(QMainWindow):
         if files:
             self.add_files_to_pool(files)
 
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Wybierz folder do udostępnienia")
+        if folder:
+            self.add_folder_to_pool(folder)
+
     def prompt_add_link(self):
         url, ok = QInputDialog.getText(self, "Udostępnij link WWW", "Wklej adres URL do zawieszenia w puli:")
         if ok and url.strip():
@@ -1746,6 +2074,124 @@ class MainWindow(QMainWindow):
             self.refresh_my_pool_ui()
             self.status_lbl.setText(f"Dodano {len(added)} plik(ów) do Twojej puli.")
             self.discovery._send_beacon("beacon")
+
+    def add_folder_to_pool(self, folder_path):
+        item = self.pool.add_folder(folder_path)
+        if item:
+            self.refresh_my_pool_ui()
+            self.status_lbl.setText(f"Dodano folder '{item.name}' ({item.file_count} plików, {format_size(item.size)}) do Twojej puli.")
+            self.discovery._send_beacon("beacon")
+
+    def add_paths_to_pool(self, paths):
+        added_files = []
+        added_folders = 0
+        for p in paths:
+            if os.path.isdir(p):
+                it = self.pool.add_folder(p)
+                if it:
+                    added_folders += 1
+            elif os.path.isfile(p):
+                added_files.append(p)
+        if added_files:
+            self.pool.add_files(added_files)
+        if added_files or added_folders:
+            self.refresh_my_pool_ui()
+            self.status_lbl.setText(f"Dodano do puli: {len(added_files)} plików, {added_folders} folderów.")
+            self.discovery._send_beacon("beacon")
+
+    def share_update_to_pool(self):
+        project_root = r"C:\Lan drop pool"
+        if not os.path.exists(project_root):
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        update_zip_path = os.path.join(project_root, "landrop_update.zip")
+
+        try:
+            self.status_lbl.setText("Pakowanie aktualizacji LAN Drop...")
+            QApplication.processEvents()
+
+            with zipfile.ZipFile(update_zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for root, dirs, files in os.walk(project_root):
+                    if ".git" in root or "__pycache__" in root or ".venv" in root:
+                        continue
+                    for f in files:
+                        if f == "landrop_update.zip" or f.endswith(".tmp") or f.endswith(".pyc"):
+                            continue
+                        full_p = os.path.join(root, f)
+                        rel_p = os.path.relpath(full_p, project_root)
+                        zf.write(full_p, arcname=rel_p)
+
+            item = self.pool.add_update(update_zip_path, version=APP_VERSION)
+            self.refresh_my_pool_ui()
+            self.status_lbl.setText(f"🚀 Wystawiono aktualizację v{APP_VERSION} ({format_size(item.size)})! Drugi komputer wykryje ją natychmiast.")
+            self.discovery._send_beacon("beacon")
+            QMessageBox.information(
+                self,
+                "Aktualizacja wystawiona",
+                f"Paczka aktualizacyjna LAN Drop (v{APP_VERSION}) została wystawiona w sieci!\n\nNa drugim komputerze natychmiast pojawi się przycisk '⚡ WGRAJ AKTUALIZACJĘ I ZRESTARTUJ'."
+            )
+        except Exception as e:
+            self.status_lbl.setText(f"Błąd tworzenia aktualizacji: {e}")
+            QMessageBox.critical(self, "Błąd", f"Nie udało się wystawić aktualizacji:\n{e}")
+
+    def install_update(self, item):
+        f = item["file"]
+        dev_name = item.get("deviceName", "drugiego komputera")
+        ver = f.get("version", "nowa")
+
+        reply = QMessageBox.question(
+            self,
+            "Wgrać aktualizację?",
+            f"Czy chcesz pobrać i zainstalować aktualizację ({ver}) z {dev_name}?\n\nProgram automatycznie podmieni pliki w C:\\Lan drop pool i zrestartuje aplikację.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.status_lbl.setText("Pobieranie aktualizacji z sieci...")
+        self.apply_update_btn.setEnabled(False)
+        self.apply_update_btn.setText("Pobieranie aktualizacji...")
+
+        worker = UpdateWorker(f["id"], f["size"], item["ip"], item["port"])
+
+        def on_update_prog(done, total, speed):
+            pct = int((done / total) * 100) if total > 0 else 0
+            self.status_lbl.setText(f"Pobieranie aktualizacji: {pct}% ({speed:.1f} MB/s)...")
+            self.apply_update_btn.setText(f"Pobieranie {pct}%...")
+
+        def on_update_finish(bat_path):
+            self.status_lbl.setText("Aktualizacja pobrana. Restartowanie programu...")
+            self.apply_update_btn.setText("Restartowanie...")
+            try:
+                self.stop_hotspot_sync()
+            except Exception:
+                pass
+
+            pid = str(os.getpid())
+            try:
+                subprocess.Popen(
+                    ["cmd.exe", "/c", bat_path, pid],
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True
+                )
+            except Exception:
+                subprocess.Popen(["cmd.exe", "/c", bat_path, pid])
+
+            QApplication.quit()
+            sys.exit(0)
+
+        def on_update_fail(err):
+            self.status_lbl.setText(f"Błąd aktualizacji: {err}")
+            self.apply_update_btn.setEnabled(True)
+            self.apply_update_btn.setText("⚡ WGRAJ AKTUALIZACJĘ I ZRESTARTUJ")
+            QMessageBox.critical(self, "Błąd aktualizacji", f"Nie udało się wgrać aktualizacji:\n{err}")
+
+        worker.progress.connect(on_update_prog)
+        worker.finished.connect(on_update_finish)
+        worker.failed.connect(on_update_fail)
+        self.active_update_worker = worker
+        worker.start()
 
     def remove_from_my_pool(self, file_id):
         if self.pool.remove_file(file_id):
@@ -1766,13 +2212,28 @@ class MainWindow(QMainWindow):
         self.my_table.setRowCount(len(files))
 
         for row, f in enumerate(files):
-            is_link = f.get("type") == "link"
-            prefix = "🔗 " if is_link else "📄 "
+            ftype = f.get("type", "file")
+            is_link = ftype == "link"
+            is_folder = ftype == "folder"
+            is_update = ftype == "update"
+
+            if is_link:
+                prefix = "🔗 "
+                size_text = "Link WWW"
+            elif is_folder:
+                prefix = "📁 "
+                size_text = f"{format_size(f['size'])} ({f.get('file_count', 0)} pl.)"
+            elif is_update:
+                prefix = "🚀 [AKTUALIZACJA] "
+                size_text = f"{format_size(f['size'])} (v{f.get('version', '')})"
+            else:
+                prefix = "📄 "
+                size_text = format_size(f["size"])
+
             name_item = QTableWidgetItem(prefix + f["name"])
             name_item.setToolTip(f["name"])
             self.my_table.setItem(row, 0, name_item)
 
-            size_text = "Link WWW" if is_link else format_size(f["size"])
             size_item = QTableWidgetItem(size_text)
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.my_table.setItem(row, 1, size_item)
@@ -1794,11 +2255,22 @@ class MainWindow(QMainWindow):
             del_btn.clicked.connect(lambda _, fid=f["id"]: self.remove_from_my_pool(fid))
             self.my_table.setCellWidget(row, 2, del_btn)
 
+        folders_count = sum(1 for f in files if f.get("type") == "folder")
+        updates_count = sum(1 for f in files if f.get("type") == "update")
         links_count = sum(1 for f in files if f.get("type") == "link")
-        files_count = len(files) - links_count
-        summary_str = f"W puli: {files_count} plik(ów)"
+        files_count = len(files) - folders_count - updates_count - links_count
+
+        parts = []
+        if files_count > 0:
+            parts.append(f"{files_count} plik(ów)")
+        if folders_count > 0:
+            parts.append(f"{folders_count} folder(ów)")
         if links_count > 0:
-            summary_str += f", {links_count} link(ów)"
+            parts.append(f"{links_count} link(ów)")
+        if updates_count > 0:
+            parts.append(f"{updates_count} aktualizacja")
+
+        summary_str = "W puli: " + (", ".join(parts) if parts else "0 elementów")
         summary_str += f" ({format_size(self.pool.total_size())})"
         self.my_summary_lbl.setText(summary_str)
 
@@ -1809,7 +2281,6 @@ class MainWindow(QMainWindow):
     def on_peers_updated(self, peers):
         self.peers_badge.setText(f"Urządzenia: {len(peers)}")
 
-        # Zapamiętaj dotychczas zaznaczone ID plików
         previously_checked_ids = {
             item["file"]["id"]
             for cb, item in self.row_checkboxes
@@ -1817,18 +2288,36 @@ class MainWindow(QMainWindow):
         }
 
         all_remote_files = []
+        update_item_found = None
+
         for pid, peer in peers.items():
             device_name = peer.get("deviceName", "Nieznane")
             ip = peer.get("ip")
             port = peer.get("port")
             for f in peer.get("files", []):
-                all_remote_files.append({
+                item_data = {
                     "deviceId": pid,
                     "deviceName": device_name,
                     "ip": ip,
                     "port": port,
                     "file": f
-                })
+                }
+                all_remote_files.append(item_data)
+                if (f.get("type") == "update" or "landrop_update" in f.get("name", "").lower()) and not update_item_found:
+                    update_item_found = item_data
+
+        if update_item_found:
+            upd_ver = update_item_found["file"].get("version", APP_VERSION)
+            upd_dev = update_item_found["deviceName"]
+            self.update_banner_lbl.setText(f"⚡ WYKRYTO AKTUALIZACJĘ PROGRAMU: v{upd_ver} (z urządzenia {upd_dev})")
+            try:
+                self.apply_update_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.apply_update_btn.clicked.connect(lambda _, item=update_item_found: self.install_update(item))
+            self.update_banner.setVisible(True)
+        else:
+            self.update_banner.setVisible(False)
 
         self.net_table.setRowCount(len(all_remote_files))
         self.row_checkboxes.clear()
@@ -1836,10 +2325,13 @@ class MainWindow(QMainWindow):
         for row, item in enumerate(all_remote_files):
             f = item["file"]
             fid = f["id"]
-            is_link = f.get("type") == "link"
+            ftype = f.get("type", "file")
+            is_link = ftype == "link"
+            is_folder = ftype == "folder"
+            is_update = ftype == "update" or "landrop_update" in f.get("name", "").lower()
             link_url = f.get("content") or f.get("name")
 
-            # Kolumna 0: Checkbox (tylko dla plików)
+            # Kolumna 0: Checkbox
             chk_widget = QWidget()
             chk_lay = QHBoxLayout(chk_widget)
             chk_lay.setContentsMargins(6, 0, 6, 0)
@@ -1861,7 +2353,7 @@ class MainWindow(QMainWindow):
                     border-color: #10b981;
                 }
             """)
-            if is_link:
+            if is_link or is_update:
                 cb.setEnabled(False)
                 cb.setVisible(False)
             else:
@@ -1874,14 +2366,28 @@ class MainWindow(QMainWindow):
             dev_item = QTableWidgetItem(item["deviceName"])
             self.net_table.setItem(row, 1, dev_item)
 
-            # Kolumna 2: Nazwa / Link WWW
-            prefix = "🔗 " if is_link else "📄 "
+            # Kolumna 2: Nazwa
+            if is_link:
+                prefix = "🔗 "
+            elif is_folder:
+                prefix = "📁 "
+            elif is_update:
+                prefix = "🚀 [AKTUALIZACJA] "
+            else:
+                prefix = "📄 "
             name_item = QTableWidgetItem(prefix + f["name"])
             name_item.setToolTip(f["name"])
             self.net_table.setItem(row, 2, name_item)
 
             # Kolumna 3: Rozmiar
-            size_text = "Link WWW" if is_link else format_size(f["size"])
+            if is_link:
+                size_text = "Link WWW"
+            elif is_folder:
+                size_text = f"{format_size(f['size'])} ({f.get('file_count', 0)} pl.)"
+            elif is_update:
+                size_text = f"{format_size(f['size'])} (v{f.get('version', '')})"
+            else:
+                size_text = format_size(f["size"])
             size_item = QTableWidgetItem(size_text)
             size_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.net_table.setItem(row, 3, size_item)
@@ -1929,13 +2435,32 @@ class MainWindow(QMainWindow):
                 act_lay.addWidget(copy_btn)
                 self.net_table.setCellWidget(row, 4, act_box)
 
+            elif is_update:
+                upd_btn = QPushButton("⚡ Wgraj")
+                upd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                upd_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #10b981;
+                        color: #000000;
+                        font-weight: 800;
+                        padding: 6px 14px;
+                        border-radius: 6px;
+                        border: none;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover { background-color: #34d399; }
+                """)
+                upd_btn.clicked.connect(lambda _, item=item: self.install_update(item))
+                self.net_table.setCellWidget(row, 4, upd_btn)
+
             else:
                 if fid in self.active_downloads:
                     status_lbl = QLabel("Pobieranie...")
                     status_lbl.setStyleSheet("color: #10b981; font-weight: bold;")
                     self.net_table.setCellWidget(row, 4, status_lbl)
                 else:
-                    dl_btn = QPushButton("⬇ Pobierz")
+                    btn_label = "⬇ Pobierz folder" if is_folder else "⬇ Pobierz"
+                    dl_btn = QPushButton(btn_label)
                     dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                     dl_btn.setStyleSheet("""
                         QPushButton {
@@ -1953,36 +2478,36 @@ class MainWindow(QMainWindow):
                     self.net_table.setCellWidget(row, 4, dl_btn)
 
     def toggle_select_all(self):
-        file_cbs = [cb for cb, item in self.row_checkboxes if item["file"].get("type") != "link"]
-        if not file_cbs:
-            self.status_lbl.setText("Brak plików do zaznaczenia w sieci.")
+        downloadable_cbs = [cb for cb, item in self.row_checkboxes if item["file"].get("type") not in ("link", "update")]
+        if not downloadable_cbs:
+            self.status_lbl.setText("Brak plików ani folderów do zaznaczenia w sieci.")
             return
 
-        all_checked = all(cb.isChecked() for cb in file_cbs)
+        all_checked = all(cb.isChecked() for cb in downloadable_cbs)
         new_state = not all_checked
-        for cb in file_cbs:
+        for cb in downloadable_cbs:
             cb.setChecked(new_state)
 
         if new_state:
             self.select_all_btn.setText("☐ Odznacz wszystko")
-            self.status_lbl.setText(f"Zaznaczono wszystkie pliki ({len(file_cbs)}). Kliknij 'Pobierz zaznaczone'.")
+            self.status_lbl.setText(f"Zaznaczono wszystkie elementy ({len(downloadable_cbs)}). Kliknij 'Pobierz zaznaczone'.")
         else:
             self.select_all_btn.setText("☑ Zaznacz wszystko")
-            self.status_lbl.setText("Odznaczono wszystkie pliki.")
+            self.status_lbl.setText("Odznaczono wszystkie elementy.")
 
     def download_selected(self):
-        selected_items = [item for cb, item in self.row_checkboxes if cb.isChecked() and item["file"].get("type") != "link"]
+        selected_items = [item for cb, item in self.row_checkboxes if cb.isChecked() and item["file"].get("type") not in ("link", "update")]
         if not selected_items:
-            QMessageBox.information(self, "Pobieranie", "Zaznacz pliki, które chcesz pobrać, lub kliknij 'Pobierz wszystkie'.")
+            QMessageBox.information(self, "Pobieranie", "Zaznacz pliki lub foldery, które chcesz pobrać, lub kliknij 'Pobierz wszystkie'.")
             return
         self.download_batch(selected_items)
 
     def download_all(self):
-        all_files = [item for _, item in self.row_checkboxes if item["file"].get("type") != "link"]
-        if not all_files:
-            QMessageBox.information(self, "Pobieranie", "Brak plików w sieci do pobrania.")
+        all_items = [item for _, item in self.row_checkboxes if item["file"].get("type") not in ("link", "update")]
+        if not all_items:
+            QMessageBox.information(self, "Pobieranie", "Brak plików lub folderów w sieci do pobrania.")
             return
-        self.download_batch(all_files)
+        self.download_batch(all_items)
 
     def download_batch(self, items):
         count = len(items)
@@ -1992,7 +2517,7 @@ class MainWindow(QMainWindow):
             if fid not in self.active_downloads:
                 self.start_download(it)
                 started += 1
-        self.status_lbl.setText(f"Rozpoczęto pobieranie {started} z {count} plików do folderu Downloads/LanDrop (bez pakowania).")
+        self.status_lbl.setText(f"Rozpoczęto pobieranie {started} z {count} elementów do folderu Downloads/LanDrop (bez pakowania).")
 
     def open_link(self, url):
         target = url
@@ -2013,13 +2538,14 @@ class MainWindow(QMainWindow):
         fid = f["id"]
         fname = f["name"]
         fsize = f["size"]
+        ftype = f.get("type", "file")
         ip = item["ip"]
         port = item["port"]
 
         if fid in self.active_downloads:
             return
 
-        worker = DownloadWorker(fid, fname, fsize, ip, port)
+        worker = DownloadWorker(fid, fname, fsize, ip, port, item_type=ftype)
         self.active_downloads[fid] = worker
 
         card = QFrame()
@@ -2027,7 +2553,8 @@ class MainWindow(QMainWindow):
         c_lay = QVBoxLayout(card)
         c_lay.setContentsMargins(8, 6, 8, 6)
 
-        info_lbl = QLabel(f"{fname} (z {item['deviceName']})")
+        prefix = "📁 " if ftype == "folder" else "📄 "
+        info_lbl = QLabel(f"{prefix}{fname} (z {item['deviceName']})")
         info_lbl.setStyleSheet("font-size: 12px; font-weight: 700; color: #ffffff;")
 
         pbar = QProgressBar()
@@ -2049,7 +2576,7 @@ class MainWindow(QMainWindow):
             }
         """)
 
-        speed_lbl = QLabel("Pobieranie...")
+        speed_lbl = QLabel("Pobieranie folderu..." if ftype == "folder" else "Pobieranie...")
         speed_lbl.setStyleSheet("font-size: 11px; color: #71717a;")
 
         c_lay.addWidget(info_lbl)
@@ -2060,15 +2587,20 @@ class MainWindow(QMainWindow):
         def on_prog(file_id, done, total, speed_mbps):
             pct = int((done / total) * 100) if total > 0 else 0
             pbar.setValue(pct)
-            speed_lbl.setText(f"{format_size(done)} / {format_size(total)} | {speed_mbps:.1f} MB/s ({pct}%)")
+            action_desc = "Pobieranie folderu" if ftype == "folder" else "Pobieranie"
+            speed_lbl.setText(f"{action_desc}: {format_size(done)} / {format_size(total)} | {speed_mbps:.1f} MB/s ({pct}%)")
 
         def on_finish(file_id, save_path):
             pbar.setValue(100)
-            speed_lbl.setText(f"Ukończono: {save_path}")
+            if ftype == "folder":
+                speed_lbl.setText(f"Folder rozpakowany do: {save_path}")
+                self.status_lbl.setText(f"Folder '{fname}' został pobrany i rozpakowany w Downloads/LanDrop!")
+            else:
+                speed_lbl.setText(f"Ukończono: {save_path}")
+                self.status_lbl.setText(f"Pobrano {fname}!")
             speed_lbl.setStyleSheet("font-size: 11px; color: #10b981; font-weight: 700;")
             if file_id in self.active_downloads:
                 del self.active_downloads[file_id]
-            self.status_lbl.setText(f"Pobrano {fname}!")
 
         def on_fail(file_id, err):
             speed_lbl.setText(f"Błąd: {err}")
@@ -2080,7 +2612,7 @@ class MainWindow(QMainWindow):
         worker.finished.connect(on_finish)
         worker.failed.connect(on_fail)
         worker.start()
-        self.status_lbl.setText(f"Pobieranie pliku {fname}...")
+        self.status_lbl.setText(f"Rozpoczęto pobieranie {fname}...")
 
     def open_downloads_folder(self):
         dl_dir = get_download_folder()
@@ -2103,12 +2635,12 @@ class MainWindow(QMainWindow):
                 event.acceptProposedAction()
                 if hasattr(self, "drop_zone"):
                     self.drop_zone.set_hover_style()
-                self.status_lbl.setText("Upuść pliki w oknie, aby dodać je do puli...")
+                self.status_lbl.setText("Upuść pliki lub foldery w oknie, aby dodać je do puli...")
                 return True
         elif etype == QEvent.Type.DragLeave:
             if hasattr(self, "drop_zone"):
                 self.drop_zone.set_idle_style()
-            self.status_lbl.setText("Gotowy. Przeciągnij pliki w dowolne miejsce okna lub kliknij 'Dodaj link'.")
+            self.status_lbl.setText("Gotowy. Przeciągnij pliki lub foldery w dowolne miejsce okna.")
         elif etype == QEvent.Type.Drop:
             if hasattr(event, "mimeData") and event.mimeData().hasUrls():
                 if hasattr(self, "drop_zone"):
@@ -2123,7 +2655,7 @@ class MainWindow(QMainWindow):
             event.acceptProposedAction()
             if hasattr(self, "drop_zone"):
                 self.drop_zone.set_hover_style()
-            self.status_lbl.setText("Upuść pliki w oknie, aby dodać je do puli...")
+            self.status_lbl.setText("Upuść pliki lub foldery w oknie, aby dodać je do puli...")
 
     def dragMoveEvent(self, event):
         if event.mimeData().hasUrls():
@@ -2132,7 +2664,7 @@ class MainWindow(QMainWindow):
     def dragLeaveEvent(self, event):
         if hasattr(self, "drop_zone"):
             self.drop_zone.set_idle_style()
-        self.status_lbl.setText("Gotowy. Przeciągnij pliki w dowolne miejsce okna lub kliknij 'Dodaj link'.")
+        self.status_lbl.setText("Gotowy. Przeciągnij pliki lub foldery w dowolne miejsce okna.")
 
     def dropEvent(self, event: QDropEvent):
         if hasattr(self, "drop_zone"):
@@ -2142,17 +2674,9 @@ class MainWindow(QMainWindow):
             self._handle_dropped_urls(event.mimeData().urls())
 
     def _handle_dropped_urls(self, urls):
-        paths = []
-        for u in urls:
-            lp = u.toLocalFile()
-            if os.path.isfile(lp):
-                paths.append(lp)
-            elif os.path.isdir(lp):
-                for root, _, files in os.walk(lp):
-                    for f in files:
-                        paths.append(os.path.join(root, f))
+        paths = [u.toLocalFile() for u in urls if os.path.exists(u.toLocalFile())]
         if paths:
-            self.add_files_to_pool(paths)
+            self.add_paths_to_pool(paths)
 
     def stop_hotspot_sync(self):
         """Synchroniczne wyłączenie punktu dostępu Wi-Fi przed zamknięciem programu."""

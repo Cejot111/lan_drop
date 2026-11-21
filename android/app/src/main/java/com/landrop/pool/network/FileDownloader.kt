@@ -48,7 +48,8 @@ class FileDownloader(private val context: Context) {
             inputStream = connection.inputStream
 
             // Otwórz strumień wyjściowy do katalogu Downloads
-            val pair = createDownloadOutputStream(context, item.name)
+            val saveName = if (item.type == "folder" && !item.name.endsWith(".zip")) "${item.name}.zip" else item.name
+            val pair = createDownloadOutputStream(context, saveName)
             outputStream = pair.second
 
             val buffer = ByteArray(256 * 1024) // 256 KB

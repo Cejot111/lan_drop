@@ -707,6 +707,8 @@ class MainActivity : ComponentActivity() {
                 ) {
                     items(allRemoteFiles, key = { it.peerDeviceId + it.id }) { item ->
                         val isLink = item.type == "link"
+                        val isFolder = item.type == "folder"
+                        val isUpdate = item.type == "update"
                         val linkUrl = item.content ?: item.name
 
                         Card(
@@ -734,16 +736,32 @@ class MainActivity : ComponentActivity() {
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(
-                                        imageVector = if (isLink) Icons.Default.Link else Icons.Default.InsertDriveFile,
+                                        imageVector = when {
+                                            isLink -> Icons.Default.Link
+                                            isFolder -> Icons.Default.Folder
+                                            isUpdate -> Icons.Default.Upgrade
+                                            else -> Icons.Default.InsertDriveFile
+                                        },
                                         contentDescription = null,
-                                        tint = if (isLink) AccentGreen else TextMuted,
+                                        tint = if (isLink || isUpdate) AccentGreen else TextMuted,
                                         modifier = Modifier.size(24.dp)
                                     )
                                     Spacer(Modifier.width(12.dp))
                                     Column(modifier = Modifier.weight(1f)) {
-                                        Text(item.name, fontWeight = FontWeight.Bold, maxLines = 1, color = Color.White, fontSize = 14.sp)
                                         Text(
-                                            if (isLink) "Link WWW • Z: ${item.peerName}" else "${formatSize(item.size)} • Z: ${item.peerName}",
+                                            text = if (isFolder) "📁 ${item.name}" else item.name,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1,
+                                            color = Color.White,
+                                            fontSize = 14.sp
+                                        )
+                                        Text(
+                                            text = when {
+                                                isLink -> "Link WWW • Z: ${item.peerName}"
+                                                isFolder -> "Folder (${formatSize(item.size)}) • Z: ${item.peerName}"
+                                                isUpdate -> "Aktualizacja LAN Drop • Z: ${item.peerName}"
+                                                else -> "${formatSize(item.size)} • Z: ${item.peerName}"
+                                            },
                                             fontSize = 12.sp,
                                             color = TextMuted
                                         )
@@ -770,11 +788,22 @@ class MainActivity : ComponentActivity() {
                                 } else {
                                     Button(
                                         onClick = { onDownloadFile(item) },
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color.White),
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = if (isUpdate) AccentGreen else Color.White
+                                        ),
                                         shape = RoundedCornerShape(8.dp),
                                         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                                     ) {
-                                        Text("Pobierz", color = Color.Black, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                        Text(
+                                            text = when {
+                                                isFolder -> "Pobierz ZIP"
+                                                isUpdate -> "Wgraj"
+                                                else -> "Pobierz"
+                                            },
+                                            color = Color.Black,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 12.sp
+                                        )
                                     }
                                 }
                             }
