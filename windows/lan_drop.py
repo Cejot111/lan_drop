@@ -21,6 +21,7 @@ import urllib.request
 import urllib.error
 import webbrowser
 import zipfile
+import tarfile
 import tempfile
 import shutil
 from pathlib import Path
@@ -560,6 +561,64 @@ class PoolManager:
             return sum(item.size for item in self.files.values())
 
 
+class SocketWriter:
+    """Umożliwia bezpośrednie strumieniowanie archiwum zip do gniazda HTTP bez tworzenia plików tymczasowych na dysku."""
+    def __init__(self, wfile):
+        self.wfile = wfile
+        self.pos = 0
+
+    def write(self, b):
+        self.wfile.write(b)
+        self.pos += len(b)
+        return len(b)
+
+    def tell(self):
+        return self.pos
+
+    def flush(self):
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+
+
+class ProgressStream(io.RawIOBase):
+    """Opakowuje strumień sieciowy odpowiedzi HTTP, raportując postęp i prędkość w czasie rzeczywistym bez blokowania."""
+    def __init__(self, raw_resp, on_progress_callback=None):
+        self.raw = raw_resp
+        self.read_bytes = 0
+        self.on_progress = on_progress_callback
+        self.last_time = time.time()
+        self.last_bytes = 0
+
+    def read(self, n=-1):
+        chunk = self.raw.read(n)
+        if chunk:
+            self.read_bytes += len(chunk)
+            self._notify()
+        return chunk
+
+    def readinto(self, b):
+        n = self.raw.readinto(b)
+        if n:
+            self.read_bytes += n
+            self._notify()
+        return n
+
+    def _notify(self):
+        if self.on_progress:
+            now = time.time()
+            elapsed = now - self.last_time
+            if elapsed >= 0.25:
+                speed_mbps = ((self.read_bytes - self.last_bytes) / (1024 * 1024)) / elapsed
+                self.last_time = now
+                self.last_bytes = self.read_bytes
+                self.on_progress(self.read_bytes, speed_mbps)
+
+    def readable(self):
+        return True
+
+
 class HttpFileHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -599,6 +658,48 @@ class HttpFileHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if req_path.startswith("/api/stream_folder/"):
+            file_id = req_path[len("/api/stream_folder/"):].strip("/")
+            item = pool.get_item(file_id)
+            if not item:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Element nie istnieje.")
+                return
+
+            if item.type != "folder" or not os.path.isdir(item.path):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"Element nie jest folderem.")
+                return
+
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-tar")
+                self.send_header("X-Item-Type", "folder")
+                self.send_header("X-Total-Bytes", str(item.size))
+                safe_name = f"{item.name}.tar".replace('"', '\\"')
+                self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                base_dir = os.path.abspath(item.path)
+                with tarfile.open(fileobj=self.wfile, mode="w|") as tw:
+                    for root, dirs, files in os.walk(base_dir):
+                        for file in files:
+                            full_p = os.path.join(root, file)
+                            rel_p = os.path.relpath(full_p, base_dir)
+                            try:
+                                tw.add(full_p, arcname=rel_p)
+                            except Exception as add_err:
+                                print(f"[HTTP] Blad dodawania pliku {rel_p}: {add_err}")
+            except (ConnectionResetError, BrokenPipeError):
+                pass
+            except Exception as e:
+                print(f"[HTTP] Blad strumieniowania folderu tar: {e}")
+            return
+
         if req_path.startswith("/api/download/"):
             file_id = req_path[len("/api/download/"):].strip("/")
             item = pool.get_item(file_id)
@@ -626,22 +727,9 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                     self.wfile.write(b"Folder nie istnieje na dysku.")
                     return
 
-                temp_zip = None
                 try:
-                    temp_fd, temp_zip = tempfile.mkstemp(suffix=".zip", prefix="landrop_folder_")
-                    os.close(temp_fd)
-                    with zipfile.ZipFile(temp_zip, 'w', compression=zipfile.ZIP_STORED) as zf:
-                        base_dir = os.path.abspath(item.path)
-                        for root, dirs, files in os.walk(base_dir):
-                            for file in files:
-                                full_p = os.path.join(root, file)
-                                rel_p = os.path.relpath(full_p, base_dir)
-                                zf.write(full_p, arcname=rel_p)
-
-                    zip_size = os.path.getsize(temp_zip)
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
-                    self.send_header("Content-Length", str(zip_size))
                     self.send_header("X-Item-Type", "folder")
                     safe_name = f"{item.name}.zip".replace('"', '\\"')
                     self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
@@ -649,19 +737,21 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.end_headers()
 
-                    with open(temp_zip, "rb") as f:
-                        while chunk := f.read(512 * 1024):
-                            self.wfile.write(chunk)
+                    base_dir = os.path.abspath(item.path)
+                    sw = SocketWriter(self.wfile)
+                    with zipfile.ZipFile(sw, 'w', compression=zipfile.ZIP_STORED) as zf:
+                        for root, dirs, files in os.walk(base_dir):
+                            for file in files:
+                                full_p = os.path.join(root, file)
+                                rel_p = os.path.relpath(full_p, base_dir)
+                                try:
+                                    zf.write(full_p, arcname=rel_p)
+                                except Exception as ze:
+                                    print(f"[HTTP] Blad pakowania {rel_p}: {ze}")
                 except (ConnectionResetError, BrokenPipeError):
                     pass
                 except Exception as e:
-                    print(f"[HTTP] Blad strumieniowania folderu: {e}")
-                finally:
-                    if temp_zip and os.path.exists(temp_zip):
-                        try:
-                            os.remove(temp_zip)
-                        except Exception:
-                            pass
+                    print(f"[HTTP] Blad strumieniowania folderu zip: {e}")
                 return
 
             if not os.path.exists(item.path):
@@ -1062,66 +1152,65 @@ class DownloadWorker(QThread):
         self.dest_dir = get_download_folder()
 
     def run(self):
-        url = f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}"
-
         if self.item_type == "folder":
-            temp_zip = self.dest_dir / f".transfer_{uuid.uuid4().hex[:8]}.tmp"
+            url = f"http://{self.host_ip}:{self.host_port}/api/stream_folder/{self.file_id}"
+            target_folder = self.dest_dir / self.file_name
+            counter = 1
+            base_name = self.file_name
+            while target_folder.exists():
+                target_folder = self.dest_dir / f"{base_name}_{counter}"
+                counter += 1
+            target_folder.mkdir(parents=True, exist_ok=True)
+
             try:
                 req = urllib.request.Request(url)
                 req.add_header("Cache-Control", "no-cache")
-                with urllib.request.urlopen(req, timeout=15) as resp, open(temp_zip, "wb") as out_file:
-                    total_bytes = int(resp.headers.get("Content-Length", self.file_size))
-                    downloaded = 0
-                    chunk_size = 512 * 1024
-                    start_time = time.time()
-                    last_time = start_time
-                    last_bytes = 0
+                req.add_header("Accept", "application/x-tar")
 
-                    while True:
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        out_file.write(chunk)
-                        downloaded += len(chunk)
-
-                        now = time.time()
-                        elapsed = now - last_time
-                        if elapsed >= 0.2:
-                            speed_mbps = ((downloaded - last_bytes) / (1024 * 1024)) / elapsed
-                            last_time = now
-                            last_bytes = downloaded
-                            self.progress.emit(self.file_id, downloaded, total_bytes, speed_mbps)
-
-                    total_elapsed = max(0.001, time.time() - start_time)
-                    avg_speed = (downloaded / (1024 * 1024)) / total_elapsed
-                    self.progress.emit(self.file_id, downloaded, total_bytes, avg_speed)
-
-                target_folder = self.dest_dir / self.file_name
-                counter = 1
-                base_name = self.file_name
-                while target_folder.exists():
-                    target_folder = self.dest_dir / f"{base_name}_{counter}"
-                    counter += 1
-                target_folder.mkdir(parents=True, exist_ok=True)
-
-                with zipfile.ZipFile(temp_zip, 'r') as zf:
-                    zf.extractall(target_folder)
-
+                # Łączymy się z serwerem (timeout na nawiązanie połączenia 30s)
+                resp = urllib.request.urlopen(req, timeout=30)
+                # Ustawiamy timeout bezczynności gniazda na 180s (3 minuty bez żadnego pakietu),
+                # dzięki czemu transfery 80 GB trwające nawet kilkadziesiąt minut nigdy nie zostaną przerwane
                 try:
-                    temp_zip.unlink(missing_ok=True)
+                    if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "_sock"):
+                        resp.fp.raw._sock.settimeout(180.0)
                 except Exception:
                     pass
 
+                total_bytes = int(resp.headers.get("X-Total-Bytes", self.file_size))
+                if total_bytes <= 0:
+                    total_bytes = self.file_size
+
+                start_time = time.time()
+
+                def on_stream_prog(done, speed):
+                    self.progress.emit(self.file_id, min(done, total_bytes), total_bytes, speed)
+
+                ps = ProgressStream(resp, on_progress_callback=on_stream_prog)
+
+                # Bezpośrednie wypakowywanie ze strumienia sieciowego w locie
+                with tarfile.open(fileobj=ps, mode="r|*") as tr:
+                    for member in tr:
+                        clean_name = os.path.normpath(member.name).lstrip("/\\")
+                        if ".." in clean_name.split(os.sep):
+                            continue
+                        member.name = clean_name
+                        try:
+                            tr.extract(member, path=str(target_folder))
+                        except Exception as ex_err:
+                            print(f"[TAR] Blad wypakowywania {member.name}: {ex_err}")
+
+                total_elapsed = max(0.001, time.time() - start_time)
+                avg_speed = (ps.read_bytes / (1024 * 1024)) / total_elapsed
+                self.progress.emit(self.file_id, total_bytes, total_bytes, avg_speed)
                 self.finished.emit(self.file_id, str(target_folder))
+
             except Exception as e:
-                try:
-                    if temp_zip.exists():
-                        temp_zip.unlink(missing_ok=True)
-                except Exception:
-                    pass
                 self.failed.emit(self.file_id, str(e))
             return
 
+        # Pobieranie pojedynczego pliku
+        url = f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}"
         save_path = self.dest_dir / self.file_name
         counter = 1
         base_stem = save_path.stem
@@ -1133,10 +1222,17 @@ class DownloadWorker(QThread):
         try:
             req = urllib.request.Request(url)
             req.add_header("Cache-Control", "no-cache")
-            with urllib.request.urlopen(req, timeout=12) as resp, open(save_path, "wb") as out_file:
+            resp = urllib.request.urlopen(req, timeout=30)
+            try:
+                if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "_sock"):
+                    resp.fp.raw._sock.settimeout(180.0)
+            except Exception:
+                pass
+
+            with resp, open(save_path, "wb") as out_file:
                 total_bytes = int(resp.headers.get("Content-Length", self.file_size))
                 downloaded = 0
-                chunk_size = 512 * 1024
+                chunk_size = 1024 * 1024  # 1 MB bufor dla maksymalnej przepustowości NVMe/SSD
                 start_time = time.time()
                 last_time = start_time
                 last_bytes = 0
@@ -1150,7 +1246,7 @@ class DownloadWorker(QThread):
 
                     now = time.time()
                     elapsed = now - last_time
-                    if elapsed >= 0.2:
+                    if elapsed >= 0.25:
                         speed_mbps = ((downloaded - last_bytes) / (1024 * 1024)) / elapsed
                         last_time = now
                         last_bytes = downloaded
