@@ -41,7 +41,7 @@ from PyQt6.QtWidgets import (
 BROADCAST_PORT = 45454
 DEFAULT_HTTP_PORT = 50505
 APP_NAME = "LAN DROP"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 
 def parse_version(v_str):
     try:
