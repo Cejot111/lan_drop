@@ -41,7 +41,18 @@ from PyQt6.QtWidgets import (
 BROADCAST_PORT = 45454
 DEFAULT_HTTP_PORT = 50505
 APP_NAME = "LAN DROP"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
+
+def parse_version(v_str):
+    try:
+        parts = []
+        for x in str(v_str).strip().lstrip("v").split("."):
+            parts.append(int(x) if x.isdigit() else 0)
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts)
+    except Exception:
+        return (0, 0, 0)
 
 def format_size(bytes_num):
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
@@ -550,7 +561,17 @@ class PoolManager:
 
     def get_item(self, file_id):
         with self.lock:
-            return self.files.get(file_id)
+            if not file_id:
+                return None
+            if file_id in self.files:
+                return self.files[file_id]
+            uq_id = unquote(str(file_id)).strip()
+            if uq_id in self.files:
+                return self.files[uq_id]
+            for it in self.files.values():
+                if it.name == file_id or it.name == uq_id:
+                    return it
+            return None
 
     def count(self):
         with self.lock:
@@ -725,6 +746,38 @@ class HttpFileHandler(BaseHTTPRequestHandler):
                     self.send_response(404)
                     self.end_headers()
                     self.wfile.write(b"Folder nie istnieje na dysku.")
+                    return
+
+                # Sprawdzamy czy klient preferuje strumieniowanie TAR (np. aplikacja desktopowa) czy ZIP (przeglądarka WWW)
+                accept_hdr = self.headers.get("Accept", "")
+                is_tar_req = "format=tar" in parsed.query or "tar" in accept_hdr
+
+                if is_tar_req:
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/x-tar")
+                        self.send_header("X-Item-Type", "folder")
+                        self.send_header("X-Total-Bytes", str(item.size))
+                        safe_name = f"{item.name}.tar".replace('"', '\\"')
+                        self.send_header("Content-Disposition", f'attachment; filename="{safe_name}"')
+                        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+
+                        base_dir = os.path.abspath(item.path)
+                        with tarfile.open(fileobj=self.wfile, mode="w|") as tw:
+                            for root, dirs, files in os.walk(base_dir):
+                                for file in files:
+                                    full_p = os.path.join(root, file)
+                                    rel_p = os.path.relpath(full_p, base_dir)
+                                    try:
+                                        tw.add(full_p, arcname=rel_p)
+                                    except Exception as add_err:
+                                        print(f"[HTTP] Blad dodawania pliku {rel_p}: {add_err}")
+                    except (ConnectionResetError, BrokenPipeError):
+                        pass
+                    except Exception as e:
+                        print(f"[HTTP] Blad strumieniowania folderu tar: {e}")
                     return
 
                 try:
@@ -1153,7 +1206,6 @@ class DownloadWorker(QThread):
 
     def run(self):
         if self.item_type == "folder":
-            url = f"http://{self.host_ip}:{self.host_port}/api/stream_folder/{self.file_id}"
             target_folder = self.dest_dir / self.file_name
             counter = 1
             base_name = self.file_name
@@ -1162,43 +1214,77 @@ class DownloadWorker(QThread):
                 counter += 1
             target_folder.mkdir(parents=True, exist_ok=True)
 
-            try:
-                req = urllib.request.Request(url)
-                req.add_header("Cache-Control", "no-cache")
-                req.add_header("Accept", "application/x-tar")
+            urls_to_try = [
+                f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}?format=tar",
+                f"http://{self.host_ip}:{self.host_port}/api/stream_folder/{self.file_id}",
+                f"http://{self.host_ip}:{self.host_port}/api/download/{self.file_id}"
+            ]
 
-                # Łączymy się z serwerem (timeout na nawiązanie połączenia 30s)
-                resp = urllib.request.urlopen(req, timeout=30)
-                # Ustawiamy timeout bezczynności gniazda na 180s (3 minuty bez żadnego pakietu),
-                # dzięki czemu transfery 80 GB trwające nawet kilkadziesiąt minut nigdy nie zostaną przerwane
+            resp = None
+            last_err = None
+            for url in urls_to_try:
                 try:
-                    if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "_sock"):
-                        resp.fp.raw._sock.settimeout(180.0)
-                except Exception:
-                    pass
+                    req = urllib.request.Request(url)
+                    req.add_header("Cache-Control", "no-cache")
+                    req.add_header("Accept", "application/x-tar, application/zip, */*")
+                    r = urllib.request.urlopen(req, timeout=30)
+                    if r.status == 200:
+                        resp = r
+                        break
+                except urllib.error.HTTPError as he:
+                    last_err = he
+                    if he.code != 404:
+                        break
+                except Exception as ex:
+                    last_err = ex
+                    break
 
-                total_bytes = int(resp.headers.get("X-Total-Bytes", self.file_size))
-                if total_bytes <= 0:
-                    total_bytes = self.file_size
+            if not resp:
+                err_msg = f"Błąd pobierania folderu ({last_err}). Upewnij się, że na drugim komputerze folder jest wciąż w puli i zrestartowano program."
+                self.failed.emit(self.file_id, err_msg)
+                return
 
-                start_time = time.time()
+            try:
+                if hasattr(resp, "fp") and hasattr(resp.fp, "raw") and hasattr(resp.fp.raw, "_sock"):
+                    resp.fp.raw._sock.settimeout(180.0)
+            except Exception:
+                pass
 
-                def on_stream_prog(done, speed):
-                    self.progress.emit(self.file_id, min(done, total_bytes), total_bytes, speed)
+            content_type = resp.headers.get("Content-Type", "")
+            total_bytes = int(resp.headers.get("X-Total-Bytes", resp.headers.get("Content-Length", self.file_size)))
+            if total_bytes <= 0:
+                total_bytes = self.file_size
 
-                ps = ProgressStream(resp, on_progress_callback=on_stream_prog)
+            start_time = time.time()
 
-                # Bezpośrednie wypakowywanie ze strumienia sieciowego w locie
-                with tarfile.open(fileobj=ps, mode="r|*") as tr:
-                    for member in tr:
-                        clean_name = os.path.normpath(member.name).lstrip("/\\")
-                        if ".." in clean_name.split(os.sep):
-                            continue
-                        member.name = clean_name
-                        try:
-                            tr.extract(member, path=str(target_folder))
-                        except Exception as ex_err:
-                            print(f"[TAR] Blad wypakowywania {member.name}: {ex_err}")
+            def on_stream_prog(done, speed):
+                self.progress.emit(self.file_id, min(done, total_bytes), total_bytes, speed)
+
+            ps = ProgressStream(resp, on_progress_callback=on_stream_prog)
+
+            try:
+                if "tar" in content_type:
+                    with tarfile.open(fileobj=ps, mode="r|*") as tr:
+                        for member in tr:
+                            clean_name = os.path.normpath(member.name).lstrip("/\\")
+                            if ".." in clean_name.split(os.sep):
+                                continue
+                            member.name = clean_name
+                            try:
+                                tr.extract(member, path=str(target_folder))
+                            except Exception as ex_err:
+                                print(f"[TAR] Blad wypakowywania {member.name}: {ex_err}")
+                else:
+                    temp_zip = target_folder / f".download_{uuid.uuid4().hex[:6]}.zip"
+                    with open(temp_zip, "wb") as zf_out:
+                        while chunk := ps.read(1024 * 1024):
+                            zf_out.write(chunk)
+                    with zipfile.ZipFile(temp_zip, 'r') as zf:
+                        zf.extractall(target_folder)
+                    try:
+                        temp_zip.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 total_elapsed = max(0.001, time.time() - start_time)
                 avg_speed = (ps.read_bytes / (1024 * 1024)) / total_elapsed
@@ -1554,7 +1640,7 @@ class DropZoneWidget(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1140, 750)
         self.setMinimumSize(940, 600)
 
@@ -1605,8 +1691,11 @@ class MainWindow(QMainWindow):
         dot.setStyleSheet("color: #10b981; font-size: 16px;")
         app_title = QLabel("LAN DROP")
         app_title.setStyleSheet("font-size: 17px; font-weight: 900; letter-spacing: -0.5px; color: #ffffff;")
+        self.ver_badge = QLabel(f"v{APP_VERSION}")
+        self.ver_badge.setStyleSheet("background-color: #18181b; color: #10b981; border: 1px solid #27272a; padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: 800; font-family: monospace;")
         title_box.addWidget(dot)
         title_box.addWidget(app_title)
+        title_box.addWidget(self.ver_badge)
 
         self.ip_badge = QLabel(f"{self.local_ip}:{self.server.port}")
         self.ip_badge.setStyleSheet("background-color: #18181b; color: #a1a1aa; border: 1px solid #27272a; padding: 4px 10px; border-radius: 6px; font-family: monospace; font-size: 12px;")
@@ -2196,6 +2285,43 @@ class MainWindow(QMainWindow):
             self.discovery._send_beacon("beacon")
 
     def share_update_to_pool(self):
+        # 1. Sprawdź czy aktualizacja tej wersji jest już wystawiona w naszej puli
+        if any(it.type == "update" and parse_version(it.version) >= parse_version(APP_VERSION) for it in self.pool.files.values()):
+            self.status_lbl.setText(f"✓ Posiadasz najnowszą wersję (v{APP_VERSION}), która jest już wystawiona w puli.")
+            QMessageBox.information(
+                self,
+                "Aktualna wersja",
+                f"Program jest już w najnowszej wersji (v{APP_VERSION}), a paczka aktualizacyjna znajduje się w sieci.\n\nŻadna nowsza aktualizacja nie jest wymagana."
+            )
+            return
+
+        # 2. Sprawdź połączone urządzenia w sieci
+        peers = self.discovery.peers
+        if peers:
+            known_peer_versions = []
+            for p in peers.values():
+                p_name = p.get("deviceName", "Drugi komputer")
+                p_ver = None
+                for f in p.get("files", []):
+                    if f.get("version"):
+                        p_ver = f.get("version")
+                        break
+                if p_ver:
+                    known_peer_versions.append((p_name, p_ver))
+
+            if known_peer_versions and all(parse_version(pv) >= parse_version(APP_VERSION) for _, pv in known_peer_versions):
+                peer_desc = ", ".join(f"{pn} (v{pv})" for pn, pv in known_peer_versions)
+                reply = QMessageBox.question(
+                    self,
+                    "Program jest aktualny",
+                    f"Wszystkie komputery w sieci ({peer_desc}) posiadają już najnowszą wersję v{APP_VERSION}.\n\nCzy chcesz mimo to wystawić paczkę aktualizacyjną?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self.status_lbl.setText(f"✓ Program jest w najnowszej wersji (v{APP_VERSION}). Wszystkie komputery są zaktualizowane.")
+                    return
+
         project_root = r"C:\Lan drop pool"
         if not os.path.exists(project_root):
             project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2405,13 +2531,19 @@ class MainWindow(QMainWindow):
         if update_item_found:
             upd_ver = update_item_found["file"].get("version", APP_VERSION)
             upd_dev = update_item_found["deviceName"]
-            self.update_banner_lbl.setText(f"⚡ WYKRYTO AKTUALIZACJĘ PROGRAMU: v{upd_ver} (z urządzenia {upd_dev})")
-            try:
-                self.apply_update_btn.clicked.disconnect()
-            except Exception:
-                pass
-            self.apply_update_btn.clicked.connect(lambda _, item=update_item_found: self.install_update(item))
-            self.update_banner.setVisible(True)
+
+            if parse_version(upd_ver) > parse_version(APP_VERSION):
+                self.update_banner_lbl.setText(f"⚡ WYKRYTO NOWSZĄ AKTUALIZACJĘ: LAN Drop v{upd_ver} (Twoja wersja: v{APP_VERSION}, z {upd_dev})")
+                try:
+                    self.apply_update_btn.clicked.disconnect()
+                except Exception:
+                    pass
+                self.apply_update_btn.clicked.connect(lambda _, item=update_item_found: self.install_update(item))
+                self.apply_update_btn.setEnabled(True)
+                self.apply_update_btn.setText("⚡ WGRAJ AKTUALIZACJĘ I ZRESTARTUJ")
+                self.update_banner.setVisible(True)
+            else:
+                self.update_banner.setVisible(False)
         else:
             self.update_banner.setVisible(False)
 
@@ -2532,21 +2664,37 @@ class MainWindow(QMainWindow):
                 self.net_table.setCellWidget(row, 4, act_box)
 
             elif is_update:
-                upd_btn = QPushButton("⚡ Wgraj")
-                upd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                upd_btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #10b981;
-                        color: #000000;
-                        font-weight: 800;
-                        padding: 6px 14px;
-                        border-radius: 6px;
-                        border: none;
-                        font-size: 12px;
-                    }
-                    QPushButton:hover { background-color: #34d399; }
-                """)
-                upd_btn.clicked.connect(lambda _, item=item: self.install_update(item))
+                upd_ver = f.get("version", APP_VERSION)
+                if parse_version(upd_ver) > parse_version(APP_VERSION):
+                    upd_btn = QPushButton("⚡ Wgraj")
+                    upd_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                    upd_btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #10b981;
+                            color: #000000;
+                            font-weight: 800;
+                            padding: 6px 14px;
+                            border-radius: 6px;
+                            border: none;
+                            font-size: 12px;
+                        }
+                        QPushButton:hover { background-color: #34d399; }
+                    """)
+                    upd_btn.clicked.connect(lambda _, item=item: self.install_update(item))
+                else:
+                    upd_btn = QPushButton(f"✓ Masz v{APP_VERSION}")
+                    upd_btn.setEnabled(False)
+                    upd_btn.setStyleSheet("""
+                        QPushButton {
+                            background-color: #18181b;
+                            color: #10b981;
+                            font-weight: 700;
+                            padding: 6px 14px;
+                            border-radius: 6px;
+                            border: 1px solid #27272a;
+                            font-size: 11px;
+                        }
+                    """)
                 self.net_table.setCellWidget(row, 4, upd_btn)
 
             else:
